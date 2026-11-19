@@ -50,8 +50,8 @@ class PatientCamera {
 #endif
   }
 
-  // Call from loop().  The interval prevents a camera burst from starving
-  // touch handling and keeps USB CDC traffic bounded at 115200 baud.
+  // Call from loop(). The interval leaves time for touch between frames
+  // while sampling a quick nod more than once over native USB CDC.
   void update(Stream& output, const String& promptId) {
     if (!enabled_) return;
     if (promptId != promptId_) {
@@ -71,7 +71,7 @@ class PatientCamera {
   }
 
  private:
-  static constexpr uint32_t kFrameIntervalMs = 200;
+  static constexpr uint32_t kFrameIntervalMs = 80;
   static constexpr uint32_t kMaxBurstMs = 12000;
   static constexpr size_t kMaxJpegBytes = 40 * 1024;
   bool enabled_ = false;

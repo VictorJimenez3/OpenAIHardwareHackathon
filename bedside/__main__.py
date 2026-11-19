@@ -42,7 +42,9 @@ class CameraInput:
         count = 0
         ready_reported = False
         last_report = time.monotonic()
-        with HeadGestures() as model:
+        # The CoreS3 now samples up to 12.5 fps. Keep the motion and
+        # occlusion windows long enough for a deliberate down-and-up nod.
+        with HeadGestures(calibration_frames=10, max_gap_frames=7, candidate_max_frames=30) as model:
             while not self.stop.is_set():
                 try:
                     received, event = self.frame.get(timeout=0.2)
