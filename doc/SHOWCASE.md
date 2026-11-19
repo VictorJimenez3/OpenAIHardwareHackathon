@@ -28,6 +28,10 @@ Use `--simulate both --voice off` with any of these modes to test in a separate 
 
 ## Evidence and next test
 
-The team ran the touchscreen, exact review, caregiver display, and acknowledgment on both physical boards. The Mac generated GPT-Live audio in the same run. The CoreS3 camera streamed at about five frames per second. Live head-gesture trials reached calibration but missed deliberate movements, so the showcase uses touch or a separately verified swipe input.
+In one physical run, the model asked about the right shoulder and the patient sent “I have pain in my right shoulder.” The StickS3 displayed the exact message and its blue button returned acknowledgment, about eight seconds after Start in that run. GPT-Live generated the questions on the Mac. Camera frames streamed at about five per second. Live head-gesture trials missed deliberate movements.
 
 Compare a fixed board and the spoken check-in using the same access method and intended request. Record the exact message, deliberate actions, elapsed time, and retries. The [project demo plan](USER_STORY_AND_DEMO.md) includes the comparison worksheet.
+
+## Proposed next flow
+
+Give the patient a way to approve and send “I'm in pain” immediately. Let the caregiver see that report while the patient answers optional follow-ups. Start with a broad location when clues are sparse, such as upper or lower body, then ask for a specific region only when it adds useful information. Each confirmed update should appear on the same caregiver request.

@@ -19,6 +19,11 @@ class PatientGesture {
   PatientGesture() = default;
 
   static constexpr uint8_t kGestureAddress = 0x73;
+  static constexpr int kPortASda = 2;
+  static constexpr int kPortAScl = 1;
+  static constexpr int kPortBSda = 9;
+  static constexpr int kPortBScl = 8;
+  static constexpr uint32_t kGestureClock = 100000;
 
   // Enable or disable one gesture session.  A ready/error event is emitted at
   // most once for each enable cycle.  A missing sensor is a reported feature
@@ -41,31 +46,47 @@ class PatientGesture {
     }
     if (readySent_) return ready_;
 
+    // M5.begin() normally enables the CoreS3 Grove 5 V rail. Keep the call
+    // opt-in and conditional so an otherwise touch-only boot is unchanged.
+    if (!M5.Power.getExtOutput()) M5.Power.setExtOutput(true);
+
+    // Probe the documented red Port.A explicitly at 100 kHz. If the unit was
+    // accidentally put on the DinBase black Port.B, try that exposed GPIO
+    // pair as a bounded recovery; both paths use the same four-wire 5 V/GND
+    // Grove supply and the ESP32 GPIO matrix supports I2C on either pair.
+    int probeA = -1;
+    int probeB = -1;
     if (!attached_) {
-      // CoreS3 Port.A is resolved by M5UnitUnified to SDA=2, SCL=1.  This is
-      // deliberately done only after opt-in, keeping an unplugged unit from
-      // delaying normal boot or touch handling.
-      if (!m5::unit::wiring::addI2C(units_, sensor_)) {
-        sendError(output, "gesture_bus");
+      probeA = beginAndProbeBus(kPortASda, kPortAScl);
+      if (probeA == 0) {
+        selectedSda_ = kPortASda;
+        selectedScl_ = kPortAScl;
+      } else {
+        probeB = beginAndProbeBus(kPortBSda, kPortBScl);
+        if (probeB == 0) {
+          selectedSda_ = kPortBSda;
+          selectedScl_ = kPortBScl;
+        }
+      }
+      if (selectedSda_ < 0 || !units_.add(sensor_, Wire)) {
+        sendProbeError(output, probeA, probeB);
         enabled_ = false;
         readySent_ = true;
         ready_ = false;
         return false;
       }
       attached_ = true;
-    }
-
-    // Fail fast before the official driver's long register-init sequence.
-    // This keeps an unplugged unit from spending a default I2C timeout on
-    // every register while the touch UI is otherwise usable.
-    Wire.setTimeOut(20);
-    Wire.beginTransmission(kGestureAddress);
-    if (Wire.endTransmission(true) != 0) {
-      sendError(output, "gesture_not_found");
-      enabled_ = false;
-      readySent_ = true;
-      ready_ = false;
-      return false;
+    } else {
+      // On a re-enable, the existing UnitUnified adapter points at Wire; keep
+      // the selected bus and only perform a short presence probe.
+      const int probe = beginAndProbeBus(selectedSda_, selectedScl_);
+      if (probe != 0) {
+        sendProbeError(output, probe, -1);
+        enabled_ = false;
+        readySent_ = true;
+        ready_ = false;
+        return false;
+      }
     }
 
     auto cfg = sensor_.config();
@@ -154,10 +175,28 @@ class PatientGesture {
   }
 
  private:
+  int beginAndProbeBus(const int sda, const int scl) {
+    Wire.end();
+    if (!Wire.begin(sda, scl, kGestureClock)) return -1;
+    Wire.setTimeOut(20);
+    delay(25);
+    Wire.beginTransmission(kGestureAddress);
+    return static_cast<int>(Wire.endTransmission(true));
+  }
+
   void sendError(Stream& output, const char* error) {
     output.print(F("{\"type\":\"gesture_error\",\"error\":\""));
     output.print(error);
     output.println(F("\"}"));
+    output.flush();
+  }
+
+  void sendProbeError(Stream& output, const int probeA, const int probeB) {
+    output.print(F("{\"type\":\"gesture_error\",\"error\":\"gesture_not_found\",\"port_a_sda\":2,\"port_a_scl\":1,\"port_a_probe\":"));
+    output.print(probeA);
+    output.print(F(",\"port_b_sda\":9,\"port_b_scl\":8,\"port_b_probe\":"));
+    output.print(probeB);
+    output.println(F("}"));
     output.flush();
   }
 
@@ -170,4 +209,6 @@ class PatientGesture {
   bool readySent_ = false;
   bool responseLatched_ = false;
   bool gestureArmed_ = true;
+  int selectedSda_ = -1;
+  int selectedScl_ = -1;
 };
