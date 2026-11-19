@@ -1,6 +1,6 @@
 """State machine for a simulated bedside check-in."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import re
 import time
@@ -50,7 +50,7 @@ LOCATION_STAGES = set(PROMPTS) | {CONFIRM_STAGE}
 QUESTION_STAGES = {"pain", "position", "followup", "handoff_question", "other_need"} | LOCATION_STAGES
 DELIVERY_TIMEOUT = 7
 ANSWER_HINT_DELAY = 9
-CAMERA_ANSWER_WINDOW = 14
+CAMERA_ARM_DELAY = 0.75
 LOCATION_IDLE_TIMEOUT = 25
 PLANNER_TIMEOUT = 3
 
@@ -64,6 +64,7 @@ class Screen:
     right_label: str = ""
     right_value: str = ""
     status: str = ""
+    receipt: str = ""
 
 
 class CheckIn:
@@ -81,9 +82,11 @@ class CheckIn:
         handoff_planner=None,
         gesture=False,
         progressive=False,
+        screen_changed=None,
     ):
         self.send = send
         self.speak = speak
+        self.screen_changed = screen_changed
         self.camera = camera
         self.clock = clock
         self.adaptive = bool(adaptive)
@@ -101,6 +104,7 @@ class CheckIn:
         self.gesture = bool(gesture)
         self.gesture_ready = False
         self.online = set()
+        self.patient_connection = None
         self.run_id = uuid4().hex[:8]
         self.prompt_number = 0
         self.report_id = ""
@@ -116,12 +120,18 @@ class CheckIn:
         self.followup_id = ""
         self.followup_source = ""
         self.no_answer_hint = False
-        self.camera_prompt = ""
+        self.camera_streaming = False
+        self.camera_scope = None
+        self.camera_generation = 0
+        self.camera_arm_at = 0
         self.camera_ready = False
         self.camera_failed = False
+        self.receipt = ""
+        self.pending_spoken_answer = ""
         self.stage = "ready"
         self.entered = self.clock()
         self.screen = self._screen()
+        self.rendered_prompt = self.prompt_id
 
     @property
     def prompt_id(self):
@@ -130,9 +140,21 @@ class CheckIn:
     def handle(self, role, event):
         kind = event.get("type")
         if kind == "hello":
+            if role in self.online and (
+                role != "patient" or event.get("connection") is self.patient_connection
+            ):
+                return
             self.online.add(role)
             LOG.info("%s connected", role.capitalize())
             if role == "patient":
+                self.patient_connection = event.get("connection")
+                self._disarm_camera()
+                self.camera_failed = False
+                if self.camera:
+                    self.camera_streaming = self.send("patient", {
+                        "type": "camera", "enabled": True, "prompt_id": self.prompt_id,
+                    })
+                    self.camera_arm_at = self.clock() + CAMERA_ARM_DELAY
                 if self.gesture:
                     self.send("patient", {"type": "gesture", "enabled": True})
                     LOG.info("Gesture input: opt-in requested")
@@ -143,9 +165,11 @@ class CheckIn:
             self.online.discard(role)
             LOG.info("%s disconnected", role.capitalize())
             if role == "patient":
-                self.camera_prompt = ""
-                self.camera_ready = False
+                self.patient_connection = None
+                self.camera_streaming = False
+                self._disarm_camera()
                 self.gesture_ready = False
+                self._update_screen()
             elif self.stage in {"sending", "delivered"}:
                 self._enter("retry")
             return
@@ -163,6 +187,10 @@ class CheckIn:
                 self._apply_pain_followup(event.get("draft"))
             return
 
+        if role == "camera":
+            self._handle_camera_event(kind, event)
+            return
+
         if role not in self.online:
             return
 
@@ -175,27 +203,30 @@ class CheckIn:
                 self.gesture_ready = False
                 LOG.warning("Gesture input unavailable: %s", event.get("error", "unknown error"))
                 self._update_screen()
+            elif kind == "camera_error" and self.camera_streaming:
+                # Firmware capture errors belong to the stream, which may
+                # have moved to a different screen before this event arrived.
+                self.camera_streaming = False
+                self._camera_error(event)
             elif event.get("prompt_id") == self.prompt_id:
-                if kind == "input":
-                    if event.get("source") == "gesture" and (
-                        not self.gesture_ready or event.get("value") not in {"start", "yes", "no"}
-                    ):
-                        return
+                if kind == "input" and event.get("source") != "camera":
                     self._answer(event.get("value"), event.get("source", "touch"))
-                elif kind == "camera_ready" and self.camera_prompt == self.prompt_id:
-                    self.camera_ready = event.get("ready", True)
-                    self._update_screen()
-                elif kind == "camera_error":
-                    error = event.get("error", "capture failed")
-                    self._stop_camera()
-                    if error == "camera_timeout":
-                        self.no_answer_hint = True
-                    else:
-                        LOG.warning("CoreS3 camera unavailable: %s", error)
-                        self.camera_failed = True
-                    self._update_screen()
         elif role == "caregiver":
             self._handle_caregiver_event(kind, event)
+
+    def _handle_camera_event(self, kind, event):
+        scope = (event.get("prompt_id"), event.get("generation"))
+        if "patient" not in self.online or self.stage not in QUESTION_STAGES or scope != self.camera_scope:
+            return
+        if kind == "camera_ready":
+            ready = event.get("ready", True)
+            if ready != self.camera_ready:
+                self.camera_ready = ready
+                self._update_screen()
+        elif kind == "camera_error":
+            self._camera_error(event)
+        elif kind == "input" and self.camera_ready and event.get("value") in ("yes", "no"):
+            self._answer(event["value"], "camera")
 
     def _handle_caregiver_event(self, kind, event):
         """Handle display/ack events without conflating report revisions.
@@ -252,7 +283,8 @@ class CheckIn:
                 self._enter("acknowledged")
 
     def tick(self):
-        elapsed = self.clock() - self.entered
+        now = self.clock()
+        elapsed = now - self.entered
         if self.stage == "sending" and elapsed >= DELIVERY_TIMEOUT:
             self._enter("retry")
         if self.stage == "choosing" and elapsed >= PLANNER_TIMEOUT:
@@ -261,34 +293,32 @@ class CheckIn:
             self._handoff_no_message()
         if self.stage == "handoff_pain_choosing" and elapsed >= PLANNER_TIMEOUT:
             self._pain_only_review()
-        if self.stage in LOCATION_STAGES and elapsed >= LOCATION_IDLE_TIMEOUT:
+        if not self.camera and self.stage in LOCATION_STAGES and elapsed >= LOCATION_IDLE_TIMEOUT:
             self._keep_plain_report()
         if self.stage not in QUESTION_STAGES:
             return
-        answer_window = CAMERA_ANSWER_WINDOW if self.camera and not self.camera_failed else ANSWER_HINT_DELAY
-        if (
-            self.camera and not self.camera_failed and "patient" in self.online
-            and not self.no_answer_hint and not self.camera_prompt and 2.3 <= elapsed < answer_window
-        ):
-            if self.send("patient", {"type": "camera", "enabled": True, "prompt_id": self.prompt_id}):
-                self.camera_prompt = self.prompt_id
-                self._update_screen()
-        if not self.no_answer_hint and elapsed >= answer_window:
-            self._stop_camera()
+        if self.camera:
+            if (
+                self.camera_streaming and not self.camera_failed and self.camera_scope is None
+                and now >= self.camera_arm_at
+            ):
+                self.camera_generation += 1
+                self.camera_scope = (self.prompt_id, self.camera_generation)
+        elif not self.no_answer_hint and elapsed >= ANSWER_HINT_DELAY:
             self.no_answer_hint = True
             self._update_screen()
 
     def _answer(self, value, source):
-        if not isinstance(value, str):
+        if not isinstance(value, str) or source not in ("touch", "camera", "gesture"):
             return
-        if value == "send" and source != "touch":
-            return
-        if source == "camera" and self.camera_prompt != self.prompt_id:
+        if (value == "send" or (self.camera and value == "start")) and source != "touch":
             return
         if source == "gesture" and (
             not self.gesture_ready or value not in {"start", "yes", "no"}
         ):
             return
+        if value in {"yes", "no"} and self.stage in QUESTION_STAGES:
+            self._record_answer(value, source)
         if value == "start" and self.stage in {
             "ready", "empty", "acknowledged",
         }:
@@ -389,6 +419,24 @@ class CheckIn:
         elif self.stage == "retry" and value == "retry":
             self._deliver()
 
+    def _record_answer(self, value, source):
+        self._disarm_camera()
+        answer = value.capitalize()
+        self.pending_spoken_answer = f"{answer} recorded."
+        if source == "gesture":
+            self.receipt = f"Swipe: {answer}"
+            return
+        if source == "camera":
+            method = "Nod accepted" if value == "yes" else "Shake accepted"
+            self.receipt = f"{method}: {answer}"
+        else:
+            method = "Touch accepted"
+            self.receipt = f"Touch: {answer}"
+        self.send("patient", {
+            "type": "answer_feedback", "prompt_id": self.prompt_id,
+            "answer": answer, "method": method,
+        })
+
     def _start_new_checkin(self):
         """Reset all report/revision state after an explicit new check-in."""
 
@@ -409,6 +457,8 @@ class CheckIn:
         self.initial_request_id = ""
         self.update_request_id = ""
         self.initial_acknowledged = False
+        self.receipt = ""
+        self.pending_spoken_answer = ""
         self.message = ""
         self.pain = False
         self.confirmed = {}
@@ -605,26 +655,52 @@ class CheckIn:
         else:
             self._enter("retry")
 
-    def _stop_camera(self):
-        if self.camera_prompt:
-            self.send("patient", {"type": "camera", "enabled": False, "prompt_id": self.camera_prompt})
-            self.camera_prompt = ""
+    def _disarm_camera(self):
+        self.camera_scope = None
         self.camera_ready = False
 
+    def _camera_error(self, event):
+        LOG.warning("CoreS3 camera unavailable: %s", event.get("error", "recognition failed"))
+        self.camera_failed = True
+        self._disarm_camera()
+        self._update_screen()
+
+    def stop_camera_stream(self):
+        self._disarm_camera()
+        self.camera_streaming = False
+        if self.camera:
+            self.send("patient", {"type": "camera", "enabled": False, "prompt_id": self.prompt_id})
+
     def _enter(self, stage):
-        self._stop_camera()
+        self._disarm_camera()
         self.stage = stage
         self.prompt_number += 1
         self.entered = self.clock()
+        self.camera_arm_at = self.entered + CAMERA_ARM_DELAY
         self.no_answer_hint = False
         self._update_screen()
+        # A new utterance interrupts the previous one. Speak the receipt with
+        # the next prompt, even when a planner takes a moment to choose it.
+        if stage in {"choosing", "handoff_choosing", "handoff_pain_choosing"}:
+            return
+        confirmation = self.pending_spoken_answer
+        self.pending_spoken_answer = ""
         if stage in QUESTION_STAGES:
-            self.speak(self.screen.text)
+            self.speak(f"{confirmation} {self.screen.text}".strip())
         elif stage == "review":
-            self.speak(self.message, exact=True)
+            self.speak(f"{confirmation} Your message is: {self.message} {self.screen.status}".strip(),
+                       exact=True)
+        elif confirmation:
+            self.speak(f"{confirmation} {self.screen.title}.", exact=True)
 
     def _update_screen(self, *, reset_input=False):
-        self.screen = self._screen()
+        screen = replace(self._screen(), receipt=self.receipt)
+        if not reset_input and screen == self.screen and self.rendered_prompt == self.prompt_id:
+            return
+        self.screen = screen
+        self.rendered_prompt = self.prompt_id
+        if self.screen_changed:
+            self.screen_changed(screen)
         LOG.info("%s | %s%s", self.screen.title, self.screen.text,
                  f" [{self.screen.status}]" if self.screen.status else "")
         if "patient" in self.online:
@@ -637,12 +713,12 @@ class CheckIn:
         if self.stage in QUESTION_STAGES:
             if self.no_answer_hint:
                 hint = "No answer yet. Use touch anytime."
-            elif self.gesture_ready:
-                hint = "Swipe right Yes, left No."
             elif self.camera_ready:
                 hint = "Nod for Yes. Shake for No."
-            elif self.camera_prompt:
+            elif self.camera_streaming and not self.camera_failed:
                 hint = "Face the camera and hold still."
+            elif self.gesture_ready:
+                hint = "Swipe right Yes, left No."
             elif self.stage == "position":
                 hint = "Pain recorded: yes." if self.pain else "Pain recorded: no."
             else:
@@ -650,7 +726,7 @@ class CheckIn:
             if self.stage == "followup":
                 question = FOLLOWUP_QUESTIONS[self.followup_id]
                 title = "Adaptive follow-up"
-                if not self.no_answer_hint and not self.camera_ready and not self.camera_prompt:
+                if not self.no_answer_hint and not self.camera_streaming:
                     hint = "AI selected this question." if self.followup_source == "live" else "Choose Yes or No."
             elif self.stage == "handoff_question":
                 if self.handoff_followup_kind == "location":
@@ -658,7 +734,7 @@ class CheckIn:
                 else:
                     question = f"Would you like {self.handoff_phrase}?"
                 title = "Care handoff"
-                if not self.no_answer_hint and not self.camera_ready and not self.camera_prompt:
+                if not self.no_answer_hint and not self.camera_streaming:
                     hint = "Confirm only if this is what you need."
             elif self.progressive and self.stage == "other_need":
                 question = OTHER_NEED_QUESTION
@@ -666,12 +742,12 @@ class CheckIn:
             elif self.progressive and self.stage == CONFIRM_STAGE:
                 question = confirmation_question(self.location)
                 title = "Confirm location"
-                if not self.no_answer_hint and not self.camera_ready and not self.camera_prompt:
+                if not self.no_answer_hint and not self.camera_streaming:
                     hint = "Confirm only if this location is correct."
             elif self.progressive and (prompt := prompt_for(self.stage)) is not None:
                 question = prompt.text
                 title = "Optional pain detail"
-                if not self.camera_prompt and not self.no_answer_hint and not self.gesture_ready:
+                if not self.camera_streaming and not self.no_answer_hint and not self.gesture_ready:
                     hint = "Pain alert sent. Location is optional."
             else:
                 question = PAIN_QUESTION if self.stage == "pain" else POSITION_QUESTION
@@ -689,7 +765,7 @@ class CheckIn:
                           "Nothing will be sent unless you confirm a request.")
         if self.stage == "review":
             return Screen("Review message", self.message, "Cancel", "cancel", "Send", "send",
-                          "Send only if the wording is right.")
+                          "Tap Send if this is right.")
         if self.stage == "sending":
             return Screen("Sending", self.message, status="Waiting for the caregiver display.")
         if self.stage == "delivered":

@@ -24,6 +24,10 @@ from typing import Any, Callable, Dict, Optional
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
+_CONTROL_LINE_BYTES = {"patient": 2048, "caregiver": 768}
+_PING = b'{"type":"ping"}\n'
+_RESET_LINE = b"\x18\n"  # CAN clears a partial command on the boards.
+
 
 def _usb_candidates() -> list[str]:
     """Return USB serial names without including Bluetooth/debug ports."""
@@ -53,6 +57,8 @@ class _Connection:
     role: Optional[str] = None
     hello_announced: bool = False
     disconnected_reported: bool = False
+    write_failed: bool = False
+    closing: bool = False
 
 
 class SerialLinks:
@@ -96,6 +102,7 @@ class SerialLinks:
         self._manager_thread: Optional[threading.Thread] = None
         self._connections: Dict[str, _Connection] = {}
         self._by_role: Dict[str, _Connection] = {}
+        self._needs_line_reset: set[str] = set()
         self._started = False
         self._last_error: Optional[str] = None
 
@@ -163,9 +170,9 @@ class SerialLinks:
     def send(self, role: str, event: dict[str, Any]) -> bool:
         """Send one JSON event to a connected role.
 
-        The payload is bounded before writing.  ``False`` means no current
-        connection exists or the write failed.  A later manager pass will
-        reconnect the port after a failed write.
+        A successful send queues the whole line with the OS. ``False`` means
+        the event could not be queued. The manager reconnects after write
+        failures.
         """
 
         if not isinstance(event, dict):
@@ -176,25 +183,19 @@ class SerialLinks:
         except (TypeError, ValueError, UnicodeError) as exc:
             self._record_error(f"encode failed: {exc}")
             return False
-        if len(encoded) > self.max_frame_bytes:
-            self._record_error(f"outgoing frame exceeds {self.max_frame_bytes} bytes")
+        # Firmware limits count bytes before the newline. Preserve a smaller
+        # configured transport limit, which also counts the newline.
+        firmware_limit = _CONTROL_LINE_BYTES.get(role, self.max_frame_bytes)
+        limit = min(self.max_frame_bytes, firmware_limit + 1)
+        if len(encoded) > limit:
+            self._record_error(f"outgoing frame for {role} exceeds {limit} bytes including newline")
             return False
 
         with self._lock:
             conn = self._by_role.get(role)
             if conn is None or self._connections.get(conn.path) is not conn:
                 return False
-        try:
-            with conn.write_lock:
-                conn.serial.write(encoded)
-                flush = getattr(conn.serial, "flush", None)
-                if callable(flush):
-                    flush()
-            return True
-        except Exception as exc:  # pyserial raises several platform exceptions
-            self._record_error(f"write to {conn.path} failed: {exc}")
-            self._drop_connection(conn)
-            return False
+        return self._write(conn, encoded)
 
     def _manager_loop(self) -> None:
         while not self._stop.is_set():
@@ -251,6 +252,18 @@ class SerialLinks:
                 self._close_serial(serial_port)
                 return
             self._connections[path] = conn
+            reset_line = path in self._needs_line_reset
+
+        # Probe before the reader can announce a role and prompt other writes.
+        # A partial write can survive closing the host port in the board's
+        # parser, so cancel that line before sending a fresh ping.
+        if not self._write(conn, _RESET_LINE + _PING if reset_line else _PING):
+            return
+
+        with self._lock:
+            self._needs_line_reset.discard(path)
+            if self._stop.is_set() or self._connections.get(path) is not conn:
+                return
             conn.thread = threading.Thread(
                 target=self._reader_loop,
                 args=(conn,),
@@ -258,9 +271,6 @@ class SerialLinks:
                 daemon=True,
             )
             conn.thread.start()
-        # Boards that were already powered before the host opened the port
-        # answer this ping with hello, giving us an unambiguous role.
-        self._write_direct(conn, {"type": "ping"})
 
     def _reader_loop(self, conn: _Connection) -> None:
         buffer = bytearray()
@@ -270,10 +280,14 @@ class SerialLinks:
             while not self._stop.is_set():
                 now = time.monotonic()
                 if now >= next_ping:
-                    self._write_direct(conn, {"type": "ping"})
+                    if not self._write(conn, _PING):
+                        break
                     next_ping = now + self.ping_interval
                 try:
-                    chunk = conn.serial.read(4096)
+                    # pyserial waits for the requested byte count or a timeout.
+                    # Only wait for the first byte when the receive queue is empty.
+                    waiting = getattr(conn.serial, "in_waiting", 0)
+                    chunk = conn.serial.read(min(4096, max(1, waiting)))
                 except Exception as exc:
                     self._record_error(f"read from {conn.path} failed: {exc}")
                     break
@@ -325,7 +339,7 @@ class SerialLinks:
         announce = False
         previous: Optional[_Connection] = None
         with self._lock:
-            if self._connections.get(conn.path) is not conn:
+            if conn.write_failed or conn.closing or self._connections.get(conn.path) is not conn:
                 return
             if conn.role is None:
                 existing = self._by_role.get(role)
@@ -345,37 +359,50 @@ class SerialLinks:
         if announce:
             self._emit(role, event)
 
-    def _write_direct(self, conn: _Connection, event: dict[str, Any]) -> bool:
-        try:
-            encoded = (
-                json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-            ).encode("utf-8")
-            with conn.write_lock:
-                conn.serial.write(encoded)
-                flush = getattr(conn.serial, "flush", None)
-                if callable(flush):
-                    flush()
-            return True
-        except Exception as exc:
-            self._record_error(f"write to {conn.path} failed: {exc}")
-            self._drop_connection(conn)
-            return False
+    def _write(self, conn: _Connection, payload: bytes) -> bool:
+        with conn.write_lock:
+            with self._lock:
+                if conn.write_failed or conn.closing or self._connections.get(conn.path) is not conn:
+                    return False
+            try:
+                written = conn.serial.write(payload)
+                if written == len(payload):
+                    return True
+                error = f"short write ({written} of {len(payload)} bytes)"
+            except Exception as exc:  # pyserial may raise after writing a prefix
+                error = str(exc)
+            with self._lock:
+                conn.write_failed = True
+                self._needs_line_reset.add(conn.path)
+
+        self._record_error(f"write to {conn.path} failed: {error}")
+        self._drop_connection(conn)
+        return False
 
     def _drop_connection(self, conn: _Connection) -> None:
         role: Optional[str]
         should_report = False
+        # Let an in-flight write mark the line for reset before this path can
+        # become eligible for another open.
+        with conn.write_lock:
+            with self._lock:
+                if conn.closing:
+                    return
+                conn.closing = True
+                role = conn.role or "unknown"
+                if self._by_role.get(role) is conn:
+                    del self._by_role[role]
+                if not conn.disconnected_reported:
+                    conn.disconnected_reported = True
+                    should_report = bool(conn.hello_announced)
+            self._close_serial(conn.serial)
+        if should_report and not self._stop.is_set():
+            self._emit(role or "unknown", {"type": "disconnected"})
+        # Reopen only after reporting this disconnect, so the next hello
+        # cannot reach the application first.
         with self._lock:
             if self._connections.get(conn.path) is conn:
                 del self._connections[conn.path]
-            role = conn.role or "unknown"
-            if self._by_role.get(role) is conn:
-                del self._by_role[role]
-            if not conn.disconnected_reported:
-                conn.disconnected_reported = True
-                should_report = bool(conn.hello_announced)
-        self._close_serial(conn.serial)
-        if should_report and not self._stop.is_set():
-            self._emit(role or "unknown", {"type": "disconnected"})
 
     @staticmethod
     def _close_serial(serial_port: Any) -> None:

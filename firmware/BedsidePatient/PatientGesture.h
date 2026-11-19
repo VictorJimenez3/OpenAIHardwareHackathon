@@ -9,6 +9,7 @@
 // {"type":"gesture","enabled":true} first.
 
 #include <Arduino.h>
+#include "PatientTransport.h"
 #include <Wire.h>
 #include <M5UnitUnified.h>
 #include <M5UnitUnifiedGESTURE.h>
@@ -28,7 +29,7 @@ class PatientGesture {
   // Enable or disable one gesture session.  A ready/error event is emitted at
   // most once for each enable cycle.  A missing sensor is a reported feature
   // error, not a reason to stop the touch UI or the serial loop.
-  bool setEnabled(bool enabled, const String& promptId, Stream& output) {
+  bool setEnabled(bool enabled, const String& promptId, PatientTransport& output) {
     if (!enabled) {
       enabled_ = false;
       readySent_ = false;
@@ -111,8 +112,7 @@ class PatientGesture {
     readySent_ = true;
     responseLatched_ = false;
     gestureArmed_ = false;
-    output.println(F("{\"type\":\"gesture_ready\"}"));
-    output.flush();
+    output.sendControl(F("{\"type\":\"gesture_ready\"}\n"));
     return true;
   }
 
@@ -184,20 +184,15 @@ class PatientGesture {
     return static_cast<int>(Wire.endTransmission(true));
   }
 
-  void sendError(Stream& output, const char* error) {
-    output.print(F("{\"type\":\"gesture_error\",\"error\":\""));
-    output.print(error);
-    output.println(F("\"}"));
-    output.flush();
+  void sendError(PatientTransport& output, const char* error) {
+    output.sendControl(String(F("{\"type\":\"gesture_error\",\"error\":\"")) + error + F("\"}\n"));
   }
 
-  void sendProbeError(Stream& output, const int probeA, const int probeB) {
-    output.print(F("{\"type\":\"gesture_error\",\"error\":\"gesture_not_found\",\"port_a_sda\":2,\"port_a_scl\":1,\"port_a_probe\":"));
-    output.print(probeA);
-    output.print(F(",\"port_b_sda\":9,\"port_b_scl\":8,\"port_b_probe\":"));
-    output.print(probeB);
-    output.println(F("}"));
-    output.flush();
+  void sendProbeError(PatientTransport& output, const int probeA, const int probeB) {
+    output.sendControl(String(F("{\"type\":\"gesture_error\",\"error\":\"gesture_not_found\","
+                                "\"port_a_sda\":2,\"port_a_scl\":1,\"port_a_probe\":")) +
+                       probeA + F(",\"port_b_sda\":9,\"port_b_scl\":8,\"port_b_probe\":") +
+                       probeB + F("}\n"));
   }
 
   m5::unit::UnitUnified units_;

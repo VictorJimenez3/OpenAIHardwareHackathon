@@ -223,14 +223,18 @@ void handleMessage(const String &line) {
 
 void readSerial() {
   static String line;
+  static bool discardLine = false;
   while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
+    const char c = static_cast<char>(Serial.read());
     if (c == '\n') {
-      line.trim();
-      if (line.length() > 0) handleMessage(line);
-      line = String();
-    } else if (c != '\r' && line.length() < 768) {
-      line += c;
+      if (!discardLine) {
+        line.trim();
+        if (line.startsWith("{") && line.endsWith("}")) handleMessage(line);
+      }
+      line = "";
+      discardLine = false;
+    } else if (c != '\r' && !discardLine) {
+      if (c == '\x18' || line.length() >= 768 || !line.concat(c)) discardLine = true;
     }
   }
 }
@@ -242,6 +246,9 @@ void setup() {
   M5.begin(config);
   M5.Display.setRotation(1);
   M5.Display.setTextWrap(false);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  Serial.setRxBufferSize(2048);
+#endif
   Serial.begin(kBaud);
   delay(100);
   drawWaiting();

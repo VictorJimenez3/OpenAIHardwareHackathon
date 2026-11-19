@@ -13,6 +13,7 @@ import time
 
 from dotenv import dotenv_values
 
+from .camera_preview import CameraPreview
 from .session import CheckIn
 from .voice import Voice
 
@@ -21,24 +22,28 @@ LOG = logging.getLogger("bedside")
 
 
 class CameraInput:
-    def __init__(self, emit):
+    def __init__(self, emit, current_scope):
         self.emit = emit
+        self.current_scope = current_scope
         self.frame = queue.Queue(maxsize=1)
+        self.submit_lock = threading.Lock()
         self.stop = threading.Event()
         self.worker = threading.Thread(target=self._run, name="head-gestures", daemon=True)
         self.worker.start()
 
-    def submit(self, event):
-        try:
-            self.frame.get_nowait()
-        except queue.Empty:
-            pass
-        self.frame.put_nowait((time.monotonic(), event))
+    def submit(self, scope, jpeg):
+        with self.submit_lock:
+            try:
+                self.frame.get_nowait()
+            except queue.Empty:
+                pass
+            self.frame.put_nowait((time.monotonic(), scope, jpeg))
 
     def _run(self):
         from .vision import HeadGestures
 
-        prompt_id = ""
+        active_scope = None
+        failed_scope = None
         count = 0
         ready_reported = False
         last_report = time.monotonic()
@@ -47,28 +52,36 @@ class CameraInput:
         with HeadGestures(calibration_frames=10, max_gap_frames=7, candidate_max_frames=30) as model:
             while not self.stop.is_set():
                 try:
-                    received, event = self.frame.get(timeout=0.2)
+                    received, scope, jpeg = self.frame.get(timeout=0.2)
                 except queue.Empty:
                     continue
-                if time.monotonic() - received > 0.7:
+                if (
+                    scope == failed_scope or scope != self.current_scope()
+                    or time.monotonic() - received > 0.7
+                ):
                     continue
-                if prompt_id != event["prompt_id"]:
-                    prompt_id = event["prompt_id"]
+                prompt_id, generation = scope
+                if active_scope != scope:
+                    active_scope = scope
                     model.reset(prompt_id)
                     count = 0
                     ready_reported = False
                     last_report = time.monotonic()
                 try:
-                    answer = model.feed(event["jpeg"])
+                    answer = model.feed(jpeg)
                 except Exception:
                     LOG.exception("Camera recognition failed; use touch")
-                    self.emit("patient", {"type": "camera_error", "prompt_id": prompt_id})
-                    return
+                    failed_scope = scope
+                    self.emit("camera", {"type": "camera_error", "prompt_id": prompt_id,
+                                         "generation": generation})
+                    continue
+                if scope != self.current_scope() or self.stop.is_set():
+                    continue
                 count += 1
                 if ready_reported != model.ready:
                     ready_reported = model.ready
-                    self.emit("patient", {"type": "camera_ready", "prompt_id": prompt_id,
-                                          "ready": ready_reported})
+                    self.emit("camera", {"type": "camera_ready", "prompt_id": prompt_id,
+                                         "generation": generation, "ready": ready_reported})
                 elapsed = time.monotonic() - last_report
                 if elapsed >= 3:
                     LOG.info("Camera input: %.1f fps (%s, %s, %s)", count / elapsed, model.backend,
@@ -76,8 +89,8 @@ class CameraInput:
                     count = 0
                     last_report = time.monotonic()
                 if answer:
-                    self.emit("patient", {"type": "input", "prompt_id": prompt_id,
-                                          "value": answer, "source": "camera"})
+                    self.emit("camera", {"type": "input", "prompt_id": prompt_id,
+                                         "generation": generation, "value": answer})
 
     def close(self):
         self.stop.set()
@@ -220,16 +233,30 @@ def main():
     def emit(role, packet):
         events.put((role, packet))
 
-    camera = CameraInput(emit) if args.camera else None
+    camera = None
+    preview = CameraPreview() if args.camera else None
     planner = AdaptivePlanner(emit) if (args.adaptive or args.handoff) else None
 
+    def show_preview_status(screen):
+        cue = "\n".join(filter(None, (screen.text, screen.status)))
+        preview.set_status(cue, screen.receipt)
+
     def on_wire(role, event):
-        if role in simulated:
+        if role not in ("patient", "caregiver") or role in simulated:
             return
-        if event.get("type") == "frame":
-            if camera and camera.worker.is_alive() and isinstance(event.get("jpeg"), str) and isinstance(event.get("prompt_id"), str):
-                camera.submit(event)
+        kind = event.get("type")
+        if kind == "frame":
+            jpeg = event.get("jpeg")
+            if role == "patient" and preview is not None and isinstance(jpeg, str) and jpeg:
+                scope = controller.camera_scope
+                preview.submit(jpeg)
+                if camera and scope is not None and event.get("prompt_id") == scope[0]:
+                    camera.submit(scope, jpeg)
             return
+        if role == "patient" and kind == "hello":
+            # SerialLinks emits hello once per connection. A replacement can
+            # arrive without an intervening disconnect from the old port.
+            event = {**event, "connection": object()}
         emit(role, event)
 
     links = None
@@ -271,8 +298,16 @@ def main():
         handoff_planner=planner if args.handoff else None,
         gesture=args.gesture,
         progressive=not (args.adaptive or args.handoff or args.scripted),
+        screen_changed=show_preview_status if preview is not None else None,
     )
     try:
+        if preview is not None:
+            show_preview_status(controller.screen)
+            try:
+                preview.start()
+            except Exception:
+                LOG.exception("Could not open the CoreS3 camera preview")
+            camera = CameraInput(emit, lambda: controller.camera_scope)
         if simulated:
             LOG.info("Simulated role(s): %s", ", ".join(sorted(simulated)))
             LOG.info("Terminal commands: start, yes, no, send, cancel, retry, ack, quit")
@@ -323,11 +358,12 @@ def main():
         if links:
             if args.gesture:
                 links.send("patient", {"type": "gesture", "enabled": False})
-            if controller.camera_prompt:
-                links.send("patient", {"type": "camera", "enabled": False, "prompt_id": controller.camera_prompt})
+            controller.stop_camera_stream()
             links.close()
         if camera:
             camera.close()
+        if preview is not None:
+            preview.close()
         if planner:
             planner.close()
         voice.close()
