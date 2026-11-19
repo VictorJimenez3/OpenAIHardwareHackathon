@@ -1,6 +1,6 @@
 # Bedside Check-In
 
-A hardware hackathon prototype for a simulated ICU patient who can answer yes or no but has difficulty speaking or typing. The patient answers two spoken questions on the CoreS3, reviews the exact sentence, and explicitly sends it to the StickS3. The caregiver presses a physical button to acknowledge receipt.
+A hardware hackathon prototype for a simulated ICU patient who can answer yes or no but has difficulty speaking or typing. The patient can send a plain pain alert from the CoreS3 before answering optional questions about its location. The caregiver sees the message on the StickS3 and presses a physical button to acknowledge receipt.
 
 ## Run the demo
 
@@ -12,12 +12,12 @@ uv run --python 3.12 --extra live python -m bedside
 
 The host finds the boards by their reported roles. If needed, set `--patient-port` and `--caregiver-port` explicitly. Leave the Mac speaker on. `OPENAI_API_KEY` can be provided through the environment or the gitignored `.env` file. The `live` extra installs the GPT-Live client, which uses `ffplay` for playback. Use `--voice local` to select macOS speech. Review uses macOS speech so the spoken text stays identical to the message.
 
-1. On the CoreS3, touch **Start → Yes → Yes**.
-2. Review “I'm in pain and would like help changing my position.” Touch **Send**.
-3. Check that the StickS3 displays that sentence. Press its blue front button next to the screen.
-4. Look for **Caregiver acknowledged** on the CoreS3. Use **New check-in** to reset.
+1. On the CoreS3, touch **Start → Yes**.
+2. Review “I'm in pain.” Touch **Send**. Check that the StickS3 displays the alert before the CoreS3 asks about location.
+3. Answer the optional questions to narrow the pain from upper or lower body to a region. To try the lower-leg path, answer **No → No → Yes**. Review and send the location update.
+4. Press the blue button on the StickS3. Look for **Caregiver acknowledged** on the CoreS3 before starting a new check-in.
 
-For the no-response demo, open the first question and wait. The CoreS3 shows **No answer yet** and the StickS3 stays idle. **Cancel** at review ends the session before delivery. A delivery failure shows **Retry** and preserves the same approved message and request ID.
+Answering **No** to pain opens one question about other help. **Yes** offers a generic help request for review. **No** ends the check-in. Silence on the first question leaves it open. Optional location questions time out after 25 seconds, leaving the first pain alert on the StickS3. A delivery failure shows **Retry** and preserves the same approved message and request ID.
 
 ## Try a different care context
 
@@ -28,7 +28,7 @@ uv run --python 3.12 --extra live python -m bedside \
 
 Use a short fictional caregiver note. The first question asks whether the person is experiencing pain. After a **Yes**, the model can ask one specific yes/no follow-up about the location or a requested form of help. If the patient declines it, or the note has no useful clue, the person can review the plain pain report. Every message requires a separate **Send**.
 
-`--adaptive --scenario comfort`, `--adaptive --scenario mouth`, and `--adaptive --scenario pain` run repeatable scenarios. The planner uses the scenario and the patient’s confirmed pain answer to pick a follow-up or move to review. The local scenario question tree handles planner timeouts.
+`--adaptive --scenario comfort`, `--adaptive --scenario mouth`, and `--adaptive --scenario pain` run repeatable scenarios. The planner uses the scenario and the patient’s confirmed pain answer to pick a follow-up or move to review. The local scenario question tree handles planner timeouts. Use `--scripted` for the original pain and position demo.
 
 `--camera` enables experimental nod and shake input while a yes/no question is open. Keep the CoreS3 level and face its camera. Hold still until the movement cue appears, then make one deliberate motion and return to center. Start and Send are touch controls. If the camera window ends without an answer, use the touchscreen when **No answer yet** appears. Use the [demo trial criteria](doc/PROJECT_SETUP.md#demo-decisions) before presenting camera input to an audience.
 
@@ -44,6 +44,6 @@ Build the two sketches in `firmware/` with the M5Stack Arduino ESP32 board packa
 uv run --python 3.12 python -m bedside --simulate both --voice local
 ```
 
-Enter `start`, `yes`, `yes`, `send`, and `ack` on separate lines. `--simulate patient` or `--simulate caregiver` replaces only one board. Use `quit` to stop a simulated run or Ctrl+C to stop the physical demo.
+To test the lower-leg path, enter `start`, `yes`, `send`, `no`, `no`, `yes`, `send`, and `ack` on separate lines. `--simulate patient` or `--simulate caregiver` replaces only one board. Use `quit` to stop a simulated run or Ctrl+C to stop the physical demo.
 
 The [showcase runbook](doc/SHOWCASE.md) has the walk-up demo. The [project setup](doc/PROJECT_SETUP.md) and [user story](doc/USER_STORY_AND_DEMO.md) contain the original build plan.

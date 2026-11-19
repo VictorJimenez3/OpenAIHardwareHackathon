@@ -6,10 +6,23 @@ import re
 import time
 from uuid import uuid4
 
+from .pain_location import (
+    CONFIRM_STAGE,
+    FIRST_STAGE,
+    PROMPTS,
+    confirmation_question,
+    next_location_stage,
+    prompt_for,
+    update_message,
+)
+
 
 LOG = logging.getLogger(__name__)
 PAIN_QUESTION = "Are you experiencing pain?"
 POSITION_QUESTION = "Would you like help changing your position?"
+OTHER_NEED_QUESTION = "Do you need help with something else?"
+PLAIN_PAIN_MESSAGE = "I'm in pain."
+OTHER_NEED_MESSAGE = "I need help with something else."
 FOLLOWUP_QUESTIONS = {
     "reposition": POSITION_QUESTION,
     "pain_check": "Would you like someone to check on your pain?",
@@ -33,10 +46,12 @@ SCENARIO_FALLBACK = {
     "pain": "review_now",
     "mouth": "mouth_care",
 }
-QUESTION_STAGES = {"pain", "position", "followup", "handoff_question"}
+LOCATION_STAGES = set(PROMPTS) | {CONFIRM_STAGE}
+QUESTION_STAGES = {"pain", "position", "followup", "handoff_question", "other_need"} | LOCATION_STAGES
 DELIVERY_TIMEOUT = 7
 ANSWER_HINT_DELAY = 9
 CAMERA_ANSWER_WINDOW = 14
+LOCATION_IDLE_TIMEOUT = 25
 PLANNER_TIMEOUT = 3
 
 
@@ -65,6 +80,7 @@ class CheckIn:
         handoff=None,
         handoff_planner=None,
         gesture=False,
+        progressive=False,
     ):
         self.send = send
         self.speak = speak
@@ -77,6 +93,7 @@ class CheckIn:
         self.handoff_planner = handoff_planner
         self.handoff_context = str(handoff or "").strip()[:800]
         self.handoff_mode = bool(self.handoff_context)
+        self.progressive = bool(progressive and not (adaptive or self.handoff_mode))
         self.handoff_declined = ()
         self.handoff_attempts = 0
         self.handoff_phrase = ""
@@ -86,7 +103,13 @@ class CheckIn:
         self.online = set()
         self.run_id = uuid4().hex[:8]
         self.prompt_number = 0
+        self.report_id = ""
+        self.revision = 0
         self.request_id = ""
+        self.initial_request_id = ""
+        self.update_request_id = ""
+        self.initial_acknowledged = False
+        self.location = ""
         self.message = ""
         self.pain = False
         self.confirmed = {}
@@ -160,7 +183,7 @@ class CheckIn:
                         return
                     self._answer(event.get("value"), event.get("source", "touch"))
                 elif kind == "camera_ready" and self.camera_prompt == self.prompt_id:
-                    self.camera_ready = True
+                    self.camera_ready = event.get("ready", True)
                     self._update_screen()
                 elif kind == "camera_error":
                     error = event.get("error", "capture failed")
@@ -171,10 +194,61 @@ class CheckIn:
                         LOG.warning("CoreS3 camera unavailable: %s", error)
                         self.camera_failed = True
                     self._update_screen()
-        elif role == "caregiver" and event.get("request_id") == self.request_id:
-            if self.stage == "sending" and kind == "displayed":
-                self._enter("delivered")
-            elif self.stage == "delivered" and kind == "acknowledged":
+        elif role == "caregiver":
+            self._handle_caregiver_event(kind, event)
+
+    def _handle_caregiver_event(self, kind, event):
+        """Handle display/ack events without conflating report revisions.
+
+        Legacy firmware echoes only ``request_id``.  Newer hosts include the
+        logical report and revision, but those fields are optional on input so
+        an existing StickS3 remains usable.
+        """
+
+        request_id = event.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            return
+        expected_revision = None
+        if request_id == self.initial_request_id:
+            expected_revision = 0
+        elif request_id == self.update_request_id:
+            expected_revision = 1
+        if expected_revision is None:
+            return
+        if event.get("report_id") not in (None, self.report_id):
+            return
+        if event.get("revision") not in (None, expected_revision):
+            return
+
+        if kind == "acknowledged":
+            if expected_revision == 0:
+                self.initial_acknowledged = True
+                # The first report is intentionally acknowledged out of band
+                # while the patient answers location questions.  Never let
+                # that stale/early ack advance the location tree or mark a
+                # later update delivered.
+                if self.stage in {"delivered", "plain_sent"} and self.revision == 0:
+                    self._enter("acknowledged")
+            elif self.stage == "delivered" and self.revision == 1:
+                self._enter("acknowledged")
+            return
+
+        if kind != "displayed" or request_id != self.request_id:
+            return
+        if self.stage != "sending":
+            return
+        if self.progressive and self.pain and expected_revision == 0:
+            # The location dialogue starts from a confirmed display, not from
+            # caregiver acknowledgment.  The initial report remains active
+            # on the Stick until an optional, explicitly confirmed update is
+            # approved.
+            self._enter(FIRST_STAGE)
+        else:
+            self._enter("delivered")
+            # A reconnecting legacy caregiver can theoretically replay its
+            # acknowledgment before the host receives the display event.  Do
+            # not leave that already-acknowledged revision stuck in delivery.
+            if expected_revision == 0 and self.initial_acknowledged:
                 self._enter("acknowledged")
 
     def tick(self):
@@ -187,6 +261,8 @@ class CheckIn:
             self._handoff_no_message()
         if self.stage == "handoff_pain_choosing" and elapsed >= PLANNER_TIMEOUT:
             self._pain_only_review()
+        if self.stage in LOCATION_STAGES and elapsed >= LOCATION_IDLE_TIMEOUT:
+            self._keep_plain_report()
         if self.stage not in QUESTION_STAGES:
             return
         answer_window = CAMERA_ANSWER_WINDOW if self.camera and not self.camera_failed else ANSWER_HINT_DELAY
@@ -213,28 +289,20 @@ class CheckIn:
             not self.gesture_ready or value not in {"start", "yes", "no"}
         ):
             return
-        if (self.stage, value) in {("ready", "start"), ("empty", "start"), ("acknowledged", "start")}:
-            if self.stage == "acknowledged":
-                self.send("caregiver", {"type": "clear_request", "request_id": self.request_id})
-            self.request_id = ""
-            self.message = ""
-            self.pain = False
-            self.confirmed = {}
-            self.followup_id = ""
-            self.followup_source = ""
-            self.handoff_followup_kind = ""
-            if self.handoff_mode:
-                self.handoff_declined = ()
-                self.handoff_attempts = 0
-                self.handoff_phrase = ""
-                self._enter("pain")
-            else:
-                self._enter("pain")
+        if value == "start" and self.stage in {
+            "ready", "empty", "acknowledged",
+        }:
+            self._start_new_checkin()
         elif self.stage == "pain" and value in {"yes", "no"}:
             LOG.info("Pain: %s (%s)", value, source)
             self.pain = value == "yes"
             self.confirmed["pain"] = self.pain
-            if self.handoff_mode and self.pain:
+            if self.progressive and self.pain:
+                self.message = PLAIN_PAIN_MESSAGE
+                self._enter("review")
+            elif self.progressive:
+                self._enter("other_need")
+            elif self.handoff_mode and self.pain:
                 self._enter("handoff_pain_choosing")
                 self._request_pain_followup()
             elif self.handoff_mode:
@@ -245,6 +313,31 @@ class CheckIn:
                 self._request_followup()
             else:
                 self._enter("position")
+        elif self.stage == "other_need" and value in {"yes", "no"}:
+            # A No is an actual answer and ends the check-in.  A Yes gets a
+            # deliberately generic sentence; it must not guess a symptom,
+            # location, or requested intervention.
+            if value == "yes":
+                self.message = OTHER_NEED_MESSAGE
+                self._enter("review")
+            else:
+                self.message = ""
+                self._enter("empty")
+        elif self.stage in PROMPTS and value in {"yes", "no"}:
+            next_stage, location = next_location_stage(self.stage, value)
+            if next_stage is None:
+                return
+            if location is not None:
+                self.location = location
+            if next_stage == "review":
+                self._review_location()
+            else:
+                self._enter(next_stage)
+        elif self.stage == CONFIRM_STAGE and value in {"yes", "no"}:
+            if value == "yes" and self.location:
+                self._review_location()
+            else:
+                self._keep_plain_report()
         elif self.stage == "position" and value in {"yes", "no"}:
             LOG.info("Position help: %s (%s)", value, source)
             position = value == "yes"
@@ -285,13 +378,81 @@ class CheckIn:
                 self.message = ""
                 self._enter("empty")
         elif self.stage == "review" and value == "cancel":
-            self.message = ""
-            self._enter("ready")
+            if self.progressive and self.revision == 1:
+                self._keep_plain_report()
+            else:
+                self.message = ""
+                self._enter("ready")
         elif self.stage == "review" and value == "send":
-            self.request_id = uuid4().hex[:12]
+            self._prepare_delivery_request()
             self._deliver()
         elif self.stage == "retry" and value == "retry":
             self._deliver()
+
+    def _start_new_checkin(self):
+        """Reset all report/revision state after an explicit new check-in."""
+
+        old_request_id = self.update_request_id or self.initial_request_id or self.request_id
+        if old_request_id:
+            old_revision = 1 if old_request_id == self.update_request_id else 0
+            self.send("caregiver", {
+                "type": "clear_request",
+                "request_id": old_request_id,
+                "report_id": self.report_id,
+                "revision": old_revision,
+            })
+        self.run_id = uuid4().hex[:8]
+        self.prompt_number = 0
+        self.report_id = uuid4().hex[:12]
+        self.revision = 0
+        self.request_id = ""
+        self.initial_request_id = ""
+        self.update_request_id = ""
+        self.initial_acknowledged = False
+        self.message = ""
+        self.pain = False
+        self.confirmed = {}
+        self.followup_id = ""
+        self.followup_source = ""
+        self.handoff_followup_kind = ""
+        self.location = ""
+        if self.handoff_mode:
+            self.handoff_declined = ()
+            self.handoff_attempts = 0
+            self.handoff_phrase = ""
+        self._enter("pain")
+
+    def _review_location(self):
+        self.message = update_message(self.location)
+        self.revision = 1
+        self.request_id = ""
+        self.update_request_id = ""
+        self._enter("review")
+
+    def _keep_plain_report(self):
+        """Finish optional narrowing without replacing the explicit alert."""
+
+        self.location = ""
+        self.revision = 0
+        self.message = PLAIN_PAIN_MESSAGE
+        self.request_id = self.initial_request_id
+        self.update_request_id = ""
+        self._enter("acknowledged" if self.initial_acknowledged else "plain_sent")
+
+    def _prepare_delivery_request(self):
+        """Assign one wire ID to the current approved report revision.
+
+        A retry reuses ``request_id``.  A new approved revision gets a new
+        request ID while retaining the same logical ``report_id``.
+        """
+
+        if self.request_id:
+            return
+        self.request_id = uuid4().hex[:12]
+        if self.revision == 0:
+            self.initial_request_id = self.request_id
+        elif self.revision == 1:
+            self.update_request_id = self.request_id
 
     def _request_handoff(self):
         """Ask the bounded planner for one request phrase in the background."""
@@ -373,7 +534,7 @@ class CheckIn:
             return
         self.handoff_phrase = ""
         self.handoff_followup_kind = ""
-        self.message = "I'm in pain."
+        self.message = PLAIN_PAIN_MESSAGE
         self._enter("review")
 
     def _handoff_no_message(self):
@@ -414,7 +575,7 @@ class CheckIn:
         source = "live" if source == "live" else "local"
         LOG.info("Adaptive choice: %s (%s)", question_id, "model" if source == "live" else "local")
         if question_id == "review_now":
-            self.message = "I'm in pain."
+            self.message = PLAIN_PAIN_MESSAGE
             self._enter("review")
             return
         self.followup_id = question_id
@@ -425,14 +586,20 @@ class CheckIn:
         """Build only from explicit patient answers; never infer urgency."""
 
         if not followup_answer:
-            return "I'm in pain." if self.confirmed.get("pain") else ""
+            return PLAIN_PAIN_MESSAGE if self.confirmed.get("pain") else ""
         tail = FOLLOWUP_MESSAGES[self.followup_id]
         if self.confirmed.get("pain"):
             return f"I'm in pain and would like {tail}."
         return f"I'd like {tail}."
 
     def _deliver(self):
-        packet = {"type": "show_request", "request_id": self.request_id, "text": self.message}
+        packet = {
+            "type": "show_request",
+            "request_id": self.request_id,
+            "report_id": self.report_id,
+            "revision": self.revision,
+            "text": self.message,
+        }
         if "caregiver" in self.online and self.send("caregiver", packet):
             self._enter("sending")
         else:
@@ -493,6 +660,19 @@ class CheckIn:
                 title = "Care handoff"
                 if not self.no_answer_hint and not self.camera_ready and not self.camera_prompt:
                     hint = "Confirm only if this is what you need."
+            elif self.progressive and self.stage == "other_need":
+                question = OTHER_NEED_QUESTION
+                title = "Other help"
+            elif self.progressive and self.stage == CONFIRM_STAGE:
+                question = confirmation_question(self.location)
+                title = "Confirm location"
+                if not self.no_answer_hint and not self.camera_ready and not self.camera_prompt:
+                    hint = "Confirm only if this location is correct."
+            elif self.progressive and (prompt := prompt_for(self.stage)) is not None:
+                question = prompt.text
+                title = "Optional pain detail"
+                if not self.camera_prompt and not self.no_answer_hint and not self.gesture_ready:
+                    hint = "Pain alert sent. Location is optional."
             else:
                 question = PAIN_QUESTION if self.stage == "pain" else POSITION_QUESTION
                 title = "Pain" if self.stage == "pain" else "Position"
@@ -513,7 +693,8 @@ class CheckIn:
         if self.stage == "sending":
             return Screen("Sending", self.message, status="Waiting for the caregiver display.")
         if self.stage == "delivered":
-            return Screen("Message delivered", self.message, status="Waiting for acknowledgment.")
+            title = "Location update delivered" if self.progressive and self.revision == 1 else "Message delivered"
+            return Screen(title, self.message, status="Waiting for acknowledgment.")
         if self.stage == "acknowledged":
             return Screen("Caregiver acknowledged", self.message, "New check-in", "start")
         if self.stage == "retry":
@@ -521,9 +702,19 @@ class CheckIn:
                           status="Check the caregiver USB connection.")
         if self.stage == "empty":
             return Screen("Check-in complete", "No message was sent.", "New check-in", "start")
+        if self.stage == "plain_sent":
+            return Screen(
+                "Pain alert sent",
+                PLAIN_PAIN_MESSAGE,
+                status="Waiting for acknowledgment.",
+            )
         subtitle = (
             "Start with a pain check, then review one grounded follow-up."
             if self.handoff_mode
-            else "Answer two questions, then review your message."
+            else (
+                "Answer pain, send the alert, then add optional location detail."
+                if self.progressive
+                else "Answer two questions, then review your message."
+            )
         )
         return Screen("Bedside check-in", subtitle, "Start", "start")

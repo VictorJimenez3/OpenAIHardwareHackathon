@@ -63,9 +63,10 @@ class CameraInput:
                     self.emit("patient", {"type": "camera_error", "prompt_id": prompt_id})
                     return
                 count += 1
-                if not ready_reported and model.last_status == "ready":
-                    ready_reported = True
-                    self.emit("patient", {"type": "camera_ready", "prompt_id": prompt_id})
+                if ready_reported != model.ready:
+                    ready_reported = model.ready
+                    self.emit("patient", {"type": "camera_ready", "prompt_id": prompt_id,
+                                          "ready": ready_reported})
                 elapsed = time.monotonic() - last_report
                 if elapsed >= 3:
                     LOG.info("Camera input: %.1f fps (%s, %s, %s)", count / elapsed, model.backend,
@@ -198,6 +199,8 @@ def main():
                       help="Let the planner choose a useful follow-up question")
     mode.add_argument("--handoff", metavar="NOTE",
                       help="Draft a patient request from a fictional caregiver note")
+    mode.add_argument("--scripted", action="store_true",
+                      help="Use the legacy fixed pain-and-position script")
     parser.add_argument("--scenario", choices=("comfort", "pain", "mouth"), default="pain",
                         help="Simulated care context for adaptive mode")
     parser.add_argument("--simulate", choices=("both", "patient", "caregiver"),
@@ -234,12 +237,22 @@ def main():
         links = SerialLinks(on_wire, patient_port=args.patient_port, caregiver_port=args.caregiver_port)
 
     simulated_events = deque()
+    simulated_caregiver_request = ""
 
     def send(role, packet):
+        nonlocal simulated_caregiver_request
         if role in simulated:
             if packet["type"] == "show_request":
+                simulated_caregiver_request = packet["request_id"]
                 LOG.info("Simulated caregiver display | %s", packet["text"])
-                simulated_events.append((role, {"type": "displayed", "request_id": packet["request_id"]}))
+                simulated_events.append((role, {
+                    "type": "displayed",
+                    "request_id": packet["request_id"],
+                    "report_id": packet.get("report_id"),
+                    "revision": packet.get("revision"),
+                }))
+            elif packet["type"] == "clear_request" and packet["request_id"] == simulated_caregiver_request:
+                simulated_caregiver_request = ""
             return True
         return links is not None and links.send(role, packet)
 
@@ -255,6 +268,7 @@ def main():
         handoff=args.handoff,
         handoff_planner=planner if args.handoff else None,
         gesture=args.gesture,
+        progressive=not (args.adaptive or args.handoff or args.scripted),
     )
     try:
         if simulated:
@@ -275,6 +289,10 @@ def main():
             LOG.info("Adaptive mode: %s scenario | OpenAI Responses with local fallback", args.scenario)
         if args.handoff:
             LOG.info("Handoff mode: fictional note | bounded draft with explicit review")
+        if args.scripted:
+            LOG.info("Scripted mode: legacy pain-and-position flow")
+        elif not args.adaptive and not args.handoff:
+            LOG.info("Progressive mode: pain alert first, optional location update")
 
         while not stop.is_set():
             try:
@@ -287,7 +305,8 @@ def main():
                 if command == "quit":
                     break
                 if command == "ack" and "caregiver" in simulated:
-                    controller.handle("caregiver", {"type": "acknowledged", "request_id": controller.request_id})
+                    controller.handle("caregiver", {"type": "acknowledged",
+                                                   "request_id": simulated_caregiver_request})
                 elif command != "ack" and "patient" in simulated:
                     controller.handle("patient", {"type": "input", "prompt_id": controller.prompt_id,
                                                   "value": command, "source": "touch"})

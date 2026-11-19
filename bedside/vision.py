@@ -6,8 +6,7 @@ PyObjC nor a native extension. OpenCV is used when Vision is unavailable. A
 frame without a clear face never becomes an answer.
 
 ``HeadGestures`` exposes only ``"yes"``, ``"no"`` and ``None``. The latter
-covers calibration, stillness, an unclear movement, a lost face and the
-neutral period required before another answer can be accepted.
+covers calibration, stillness, an unclear movement and a lost face.
 """
 
 from __future__ import annotations
@@ -243,21 +242,18 @@ class _OpenCVDetector:
 class HeadGestures:
     """Turn a bounded JPEG stream into deliberate yes/no answers.
 
-    A fresh instance calibrates against ``calibration_frames`` neutral frames.
-    After an answer is emitted, ``feed`` requires ``neutral_frames`` frames
-    near that neutral pose before it can emit another answer. ``reset`` should
-    be called whenever the Mac activates a new yes/no question.
+    Call ``reset`` for each question. The detector calibrates to the person's
+    resting pose and accepts at most one answer for that question.
     """
 
-    def __init__(self, *, calibration_frames: int = 8, history_frames: int = 14,
+    def __init__(self, *, calibration_frames: int = 8,
                  min_amplitude: float = 0.075, axis_ratio: float = 1.22,
                  neutral_radius: float = 0.035, neutral_frames: int = 3,
-                 min_confidence: float = 0.20, angle_amplitude: float = 0.14,
-                 angle_neutral_radius: float = 0.10, neutral_stability: float = 0.05,
-                 angle_neutral_stability: float = 0.10, max_gap_frames: int = 4,
+                 min_confidence: float = 0.20, angle_amplitude: float = 0.13,
+                 angle_neutral_radius: float = 0.085, neutral_stability: float = 0.05,
+                 angle_neutral_stability: float = 0.10, max_gap_frames: int = 3,
                  candidate_max_frames: int = 15) -> None:
         self.calibration_frames = max(3, calibration_frames)
-        self.history_frames = max(6, history_frames)
         self.min_amplitude = max(0.02, min_amplitude)
         self.axis_ratio = max(1.0, axis_ratio)
         self.neutral_radius = max(0.01, neutral_radius)
@@ -279,19 +275,16 @@ class HeadGestures:
         with self._lock:
             self.prompt_id = prompt_id
             self._calibration: Deque[Tuple[float, float]] = collections.deque(maxlen=self.calibration_frames)
-            self._history: Deque[Tuple[float, float]] = collections.deque(maxlen=self.history_frames)
-            self._baseline: Optional[Tuple[float, float]] = None
-            self._mode: Optional[str] = None
-            self._candidate_axis: Optional[str] = None
-            self._candidate_sign = 0
-            self._candidate_samples = 0
-            self._candidate_neutral = 0
-            self._candidate_age = 0
-            self._neutral_gate = False
-            self._neutral_gate_count = 0
+            self._reset_tracking()
+            self._answered = False
             self._gap_count = 0
             self._last_detection_status = "calibrating"
             self.last_status = "calibrating"
+
+    @property
+    def ready(self) -> bool:
+        """Whether there is a resting pose for the current question."""
+        return self._baseline is not None
 
     @property
     def feature_mode(self) -> Optional[str]:
@@ -323,21 +316,28 @@ class HeadGestures:
         return pose
 
     def _clear_candidate(self) -> None:
-        self._candidate_axis = None
+        self._candidate_axis: Optional[str] = None
         self._candidate_sign = 0
         self._candidate_samples = 0
         self._candidate_neutral = 0
         self._candidate_age = 0
+        self._candidate_peak = 0.0
+
+    def _reset_tracking(self) -> None:
+        self._calibration.clear()
+        self._baseline: Optional[Tuple[float, float]] = None
+        self._mode: Optional[str] = None
+        self._clear_candidate()
 
     def _register_gap(self, status: str, *, hard: bool = False) -> None:
-        """Pause briefly missing frames, then require neutral recentering."""
+        """Allow short occlusions. Recover from sustained loss with a fresh baseline."""
         self._gap_count += 1
-        if hard or self._gap_count > self.max_gap_frames:
-            self._history.clear()
-            self._clear_candidate()
-            self._neutral_gate = True
-            self._neutral_gate_count = 0
-            self.last_status = status if hard else "gap_recenter_required"
+        if self._candidate_axis is not None:
+            self._candidate_age += 1
+            self._candidate_neutral = 0
+        if hard or self._gap_count > self.max_gap_frames or self._candidate_age >= self.candidate_max_frames:
+            self._reset_tracking()
+            self.last_status = status if hard else "recalibrating"
             return
         self.last_status = "gap_paused" if self._candidate_axis is not None else status
 
@@ -348,70 +348,45 @@ class HeadGestures:
 
     @staticmethod
     def _robust_baseline(points: list[Tuple[float, float]], stability: float) -> Optional[Tuple[float, float]]:
-        """Estimate neutral while discarding endpoint noise on each axis."""
+        """Use the most recent settled pose after the initial tracking window."""
         if len(points) < 3:
             return None
-        trim = max(1, len(points) // 5)
-        sorted_x = sorted(point[0] for point in points)
-        sorted_y = sorted(point[1] for point in points)
-        inner_x = sorted_x[trim:-trim] or sorted_x
-        inner_y = sorted_y[trim:-trim] or sorted_y
-        baseline = (statistics.median(inner_x), statistics.median(inner_y))
-        tolerance = stability * 2.0
-        inlier_x = [value for value in sorted_x if abs(value - baseline[0]) <= tolerance]
-        inlier_y = [value for value in sorted_y if abs(value - baseline[1]) <= tolerance]
-        required = max(3, (len(points) * 3 + 4) // 5)
-        if len(inlier_x) < required or len(inlier_y) < required:
+        recent_x, recent_y = zip(*points[-max(3, len(points) // 2):])
+        if max(recent_x) - min(recent_x) > stability or max(recent_y) - min(recent_y) > stability:
             return None
-        return baseline
+        baseline = (statistics.median(recent_x), statistics.median(recent_y))
+        tolerance = stability * 1.5
+        required = max(3, (len(points) * 3 + 4) // 5)
+        inliers = sum(abs(x - baseline[0]) <= tolerance and abs(y - baseline[1]) <= tolerance for x, y in points)
+        return baseline if inliers >= required else None
 
     def _feed_pose(self, x: float, y: float, mode: str = "center") -> Optional[str]:
         """Consume a normalized pose. Used by deterministic smoke tests."""
-        if not (math.isfinite(x) and math.isfinite(y)):
-            self.last_status = "invalid_pose"
+        if self._answered:
             return None
-        self._gap_count = 0
+        if not (math.isfinite(x) and math.isfinite(y)):
+            self._register_gap("invalid_pose")
+            return None
         if self._mode is None:
             self._mode = mode
         elif mode != self._mode:
-            self._history.clear()
-            self._clear_candidate()
-            self.last_status = "feature_mode_locked"
+            self._register_gap("feature_gap")
             return None
+        self._gap_count = 0
 
         threshold, neutral_radius, stability = self._thresholds(self._mode)
         if self._baseline is None:
+            self.last_status = "calibrating"
             self._calibration.append((x, y))
             if len(self._calibration) >= self.calibration_frames:
                 points = list(self._calibration)
                 baseline = self._robust_baseline(points, stability)
-                if baseline is not None:
-                    self._baseline = baseline
-                    self._history.clear()
-                    self.last_status = "ready"
-                else:
-                    self.last_status = "stabilizing"
+                self._baseline = baseline
+                self.last_status = "ready" if baseline is not None else "stabilizing"
             return None
 
         dx, dy = x - self._baseline[0], y - self._baseline[1]
-        self._history.append((dx, dy))
         near_neutral = abs(dx) <= neutral_radius and abs(dy) <= neutral_radius
-
-        if self._neutral_gate:
-            if near_neutral:
-                self._neutral_gate_count += 1
-                if self._neutral_gate_count >= self.neutral_frames:
-                    self._neutral_gate = False
-                    self._neutral_gate_count = 0
-                    self._history.clear()
-                    self.last_status = "ready"
-                else:
-                    self.last_status = "neutral_required"
-            else:
-                self._neutral_gate_count = 0
-                self._history.clear()
-                self.last_status = "neutral_required"
-            return None
 
         vertical, horizontal = abs(dy), abs(dx)
         if vertical >= threshold and vertical >= horizontal * self.axis_ratio:
@@ -428,52 +403,62 @@ class HeadGestures:
             value = dy if dominant == "vertical" else dx
             self._candidate_axis = dominant
             self._candidate_sign = 1 if value > 0 else -1
+            self._candidate_peak = abs(value)
             self._candidate_samples = 1
-            # At about five frames per second a clear nod can peak in just
-            # one image. Still require a return toward the calibrated pose.
-            if mode == "angles" and dominant == "vertical" and vertical >= threshold * 1.65:
-                self._candidate_samples = 2
-            self._candidate_neutral = 0
             self._candidate_age = 1
             self.last_status = "motion_candidate"
             return None
 
         self._candidate_age += 1
         if self._candidate_age > self.candidate_max_frames:
-            self._history.clear()
-            self._clear_candidate()
-            self._neutral_gate = True
-            self._neutral_gate_count = 0
+            self._reset_tracking()
             self.last_status = "candidate_timeout"
             return None
 
+        if dominant is not None and dominant != self._candidate_axis:
+            self._reset_tracking()
+            self.last_status = "ambiguous_motion"
+            return None
+
+        nod = self._candidate_axis == "vertical"
+        value = dy if nod else dx
+        strong_nod = False
+        if nod and mode == "angles":
+            # A nod can return to a slightly different resting pitch.
+            # Require a substantial reversal of the measured excursion.
+            return_radius = max(neutral_radius, min(threshold * 0.95, self._candidate_peak * 0.48))
+            near_neutral = vertical <= return_radius and horizontal <= max(neutral_radius, threshold)
+            strong_nod = self._candidate_peak >= threshold * 1.65
+
         if near_neutral:
             self._candidate_neutral += 1
-            return_frames = min(self.neutral_frames, 2) if self._candidate_axis == "vertical" else self.neutral_frames
-            if self._candidate_samples >= 2 and self._candidate_neutral >= return_frames:
-                answer = "yes" if self._candidate_axis == "vertical" else "no"
+            return_frames = min(self.neutral_frames, 2) if nod else self.neutral_frames
+            # At five frames per second, a sustained dip can have just
+            # one clear return frame before the person nods again.
+            if strong_nod and self._candidate_samples >= 2 and vertical <= self._candidate_peak * 0.35:
+                return_frames = 1
+            if self._candidate_neutral >= return_frames:
+                # A lone large peak still needs two return frames.
+                sustained = self._candidate_samples >= 2 or strong_nod
                 self._clear_candidate()
-                self._neutral_gate = True
-                self._neutral_gate_count = 0
-                self._history.clear()
+                if not sustained:
+                    self.last_status = "ready"
+                    return None
+                answer = "yes" if nod else "no"
+                self._answered = True
                 self.last_status = "accepted_" + answer
                 return answer
             self.last_status = "returning_neutral"
             return None
 
         self._candidate_neutral = 0
-        if dominant is not None and dominant != self._candidate_axis:
-            self._clear_candidate()
+        if abs(value) >= threshold and value * self._candidate_sign < 0:
+            self._reset_tracking()
             self.last_status = "ambiguous_motion"
             return None
-        value = dy if self._candidate_axis == "vertical" else dx
-        if abs(value) >= threshold:
-            sign = 1 if value > 0 else -1
-            if sign != self._candidate_sign:
-                self._clear_candidate()
-                self.last_status = "ambiguous_motion"
-                return None
+        if dominant == self._candidate_axis:
             self._candidate_samples += 1
+            self._candidate_peak = max(self._candidate_peak, abs(value))
         self.last_status = "motion_candidate"
         return None
 
@@ -485,11 +470,13 @@ class HeadGestures:
             return None
         pose = self._detect(jpeg_b64)
         with self._lock:
+            if self._answered:
+                return None
             if pose is None:
                 self._register_gap(self._last_detection_status, hard=self._last_detection_status == "ambiguous_face")
                 return None
             angles_valid = pose.angles_valid and all(
-                math.isfinite(value) for value in (pose.yaw, pose.pitch, pose.roll)
+                math.isfinite(value) for value in (pose.yaw, pose.pitch)
             )
             if self._mode == "angles":
                 if not angles_valid:
@@ -514,7 +501,7 @@ class HeadGestures:
 
 def self_test() -> bool:
     """Run a dependency-free motion test for setup checks."""
-    detector = HeadGestures(calibration_frames=4, history_frames=8, neutral_frames=2)
+    detector = HeadGestures(calibration_frames=4, neutral_frames=2)
     for _ in range(4):
         detector._feed_pose(0.5, 0.5)
     neutral_ok = all(detector._feed_pose(0.5, 0.5) is None for _ in range(6))
@@ -554,10 +541,30 @@ def self_test() -> bool:
     for _ in range(3):
         gap_result = gap_detector._feed_pose(0.5, 0.5) or gap_result
     gap_ok = gap_result == "yes"
+
+    # A shifted resting pose and a rebound visible in only one frame
+    # reproduce the missed nod at CoreS3 capture speed.
+    gap_detector.reset("reacquire")
+    for _ in range(4):
+        gap_detector._feed_pose(0.0, 0.1, "angles")
+    gap_detector._feed_pose(0.0, 0.4, "angles")
+    for _ in range(3):
+        gap_detector._register_gap("feature_gap")
+    lost_ok = not gap_detector.ready
+    holds = [gap_detector._feed_pose(0.08, -0.26, "angles") for _ in range(4)]
+    recovered = gap_detector.ready and all(answer is None for answer in holds)
+    dip = [(0.00, 0.17), (0.03, 0.09), (0.04, -0.16)]
+    observed = [gap_detector._feed_pose(yaw, pitch, "angles") for yaw, pitch in dip]
+    rebound_ok = observed == [None, None, "yes"]
+    repeated = [gap_detector._feed_pose(yaw, pitch, "angles") for yaw, pitch in dip]
+    one_answer = all(answer is None for answer in repeated)
+
     detector.close()
     gap_detector.close()
-    return neutral_ok and nod_ok and shake_ok and mixed_ok and gap_ok
+    return all((neutral_ok, nod_ok, shake_ok, mixed_ok, gap_ok, lost_ok, recovered, rebound_ok, one_answer))
 
 
 if __name__ == "__main__":
-    print("self_test:", "ok" if self_test() else "failed")
+    passed = self_test()
+    print("self_test:", "ok" if passed else "failed")
+    raise SystemExit(0 if passed else 1)
