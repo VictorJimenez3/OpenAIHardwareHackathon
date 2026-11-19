@@ -1,0 +1,12 @@
+[project]
+name = "bedside-check-in"
+version = "0.1.0"
+description = "Two-device simulated bedside communication check-in"
+requires-python = ">=3.10"
+dependencies = ["pyserial==3.5", "python-dotenv>=1.1,<2"]
+
+[project.optional-dependencies]
+live = ["openai[realtime]>=3.56,<4"]
+
+[tool.uv]
+package = false

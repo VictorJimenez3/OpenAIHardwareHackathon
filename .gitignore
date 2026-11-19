@@ -1,0 +1,6 @@
+/doc/TODO.md
+.DS_Store
+.build/
+.venv/
+.env
+__pycache__/
