@@ -254,7 +254,7 @@ class HeadGestures:
                  neutral_radius: float = 0.035, neutral_frames: int = 3,
                  min_confidence: float = 0.20, angle_amplitude: float = 0.14,
                  angle_neutral_radius: float = 0.10, neutral_stability: float = 0.05,
-                 angle_neutral_stability: float = 0.10, max_gap_frames: int = 2,
+                 angle_neutral_stability: float = 0.10, max_gap_frames: int = 4,
                  candidate_max_frames: int = 15) -> None:
         self.calibration_frames = max(3, calibration_frames)
         self.history_frames = max(6, history_frames)
@@ -429,6 +429,10 @@ class HeadGestures:
             self._candidate_axis = dominant
             self._candidate_sign = 1 if value > 0 else -1
             self._candidate_samples = 1
+            # At about five frames per second a clear nod can peak in just
+            # one image. Still require a return toward the calibrated pose.
+            if mode == "angles" and dominant == "vertical" and vertical >= threshold * 1.65:
+                self._candidate_samples = 2
             self._candidate_neutral = 0
             self._candidate_age = 1
             self.last_status = "motion_candidate"
@@ -445,7 +449,8 @@ class HeadGestures:
 
         if near_neutral:
             self._candidate_neutral += 1
-            if self._candidate_samples >= 2 and self._candidate_neutral >= self.neutral_frames:
+            return_frames = min(self.neutral_frames, 2) if self._candidate_axis == "vertical" else self.neutral_frames
+            if self._candidate_samples >= 2 and self._candidate_neutral >= return_frames:
                 answer = "yes" if self._candidate_axis == "vertical" else "no"
                 self._clear_candidate()
                 self._neutral_gate = True
