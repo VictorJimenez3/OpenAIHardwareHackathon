@@ -43,3 +43,9 @@ camera device. The firmware reports initialization and capture failures as
 `camera_error`.
 
 Select the M5Stack CoreS3 board profile in Arduino IDE, install M5Unified through the Library Manager, and upload this sketch over a data-capable USB-C cable. The sketch does not wait for the serial monitor during boot.
+
+Install M5Unit-GESTURE and its dependencies to build the U127 driver. Connect the
+unit to Port A on the CoreS3 body. The host opts in with
+`{"type":"gesture","enabled":true}` and receives `gesture_ready` or `gesture_error`.
+Swipe inputs carry the active `prompt_id` and `source:"gesture"`. The firmware
+accepts a swipe only when its action is visible on the current screen.

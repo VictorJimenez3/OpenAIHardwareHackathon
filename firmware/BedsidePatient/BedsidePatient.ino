@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include "PatientCamera.h"
+#include "PatientGesture.h"
 
 // CoreS3 patient-side display. The Mac owns the check-in state machine and
 // sends one newline-delimited JSON "screen" event at a time.
@@ -51,6 +52,7 @@ bool dirty = true;
 bool inputLatched = false;
 bool touchArmed = true;
 PatientCamera patientCamera;
+PatientGesture patientGesture;
 
 struct Button {
   int x;
@@ -136,6 +138,20 @@ void sendInput(const String &value) {
   Serial.print(F("\",\"value\":\""));
   Serial.print(jsonEscape(value));
   Serial.println(F("\",\"source\":\"touch\"}"));
+  Serial.flush();
+  lastInputAt = millis();
+  statusText = "Response sent";
+  dirty = true;
+}
+
+void sendGestureInput(const String &value) {
+  if (value.isEmpty() || inputLatched) return;
+  inputLatched = true;
+  Serial.print(F("{\"type\":\"input\",\"prompt_id\":\""));
+  Serial.print(jsonEscape(promptId));
+  Serial.print(F("\",\"value\":\""));
+  Serial.print(jsonEscape(value));
+  Serial.println(F("\",\"source\":\"gesture\"}"));
   Serial.flush();
   lastInputAt = millis();
   statusText = "Response sent";
@@ -283,6 +299,13 @@ void handleLine(const String &line) {
     patientCamera.setEnabled(enabled, cameraPrompt, Serial);
     statusText = enabled ? "Camera active" : "Camera off";
     dirty = true;
+  } else if (type == "gesture") {
+    String gesturePrompt = jsonValue(line, "prompt_id");
+    if (gesturePrompt.isEmpty()) gesturePrompt = promptId;
+    const bool enabled = jsonTrue(line, "enabled");
+    const bool gestureReady = patientGesture.setEnabled(enabled, gesturePrompt, Serial);
+    statusText = !enabled ? "Gesture input off" : (gestureReady ? "Gesture input active" : "Gesture unavailable");
+    dirty = true;
   } else if (type == "ping") {
     connected = true;
     sendHello();
@@ -329,6 +352,15 @@ void loop() {
   M5.update();
   readSerial();
   patientCamera.update(Serial, promptId);
+
+  String gestureValue;
+  const bool allowGestureYes = leftValue == "yes" || rightValue == "yes";
+  const bool allowGestureNo = leftValue == "no" || rightValue == "no";
+  const bool allowGestureStart = leftValue == "start" || rightValue == "start";
+  if (patientGesture.poll(promptId, allowGestureYes, allowGestureNo, allowGestureStart,
+                          inputLatched, gestureValue)) {
+    sendGestureInput(gestureValue);
+  }
 
   // Re-announce after reconnects and make the serial link self-discovering.
   if (millis() - lastHelloAt > 5000) sendHello();
