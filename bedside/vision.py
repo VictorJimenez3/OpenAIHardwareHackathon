@@ -1,12 +1,11 @@
-"""Conservative head-gesture recognition for CoreS3 JPEG frames.
+"""Head and hand gesture recognition for CoreS3 JPEG frames.
 
-The preferred backend is Apple's Vision face detector. A small Swift bridge is
+Apple Vision detects faces and hand landmarks on the Mac. A small Swift bridge is
 compiled on first use and kept alive as a subprocess, so Python needs neither
-PyObjC nor a native extension. OpenCV is used when Vision is unavailable. A
-frame without a clear face never becomes an answer.
+PyObjC nor a native extension. OpenCV provides a face-only fallback.
 
 ``HeadGestures`` exposes only ``"yes"``, ``"no"`` and ``None``. The latter
-covers calibration, stillness, an unclear movement and a lost face.
+covers calibration, stillness, unclear movement and tracking loss.
 """
 
 from __future__ import annotations
@@ -35,31 +34,46 @@ func emit(_ value: String) {
     FileHandle.standardOutput.write((value + "\n").data(using: .utf8)!)
 }
 
+let faceRequest = VNDetectFaceRectanglesRequest()
+let handRequest = VNDetectHumanHandPoseRequest()
+handRequest.maximumHandCount = 2
+
+func palmPosition() -> String {
+    guard let hands = handRequest.results, !hands.isEmpty else { return "none" }
+    guard hands.count == 1 else { return "ambiguous" }
+    let joints: [VNHumanHandPoseObservation.JointName] = [.indexMCP, .middleMCP, .ringMCP, .littleMCP]
+    let points = joints.compactMap { try? hands[0].recognizedPoint($0) }.filter { $0.confidence >= 0.35 }
+    guard points.count >= 3 else { return "none" }
+    let count = CGFloat(points.count)
+    let x = points.reduce(0.0) { $0 + $1.location.x } / count
+    let y = points.reduce(0.0) { $0 + $1.location.y } / count
+    return "palm \(x) \(y)"
+}
+
 while let line = readLine() {
     guard let data = Data(base64Encoded: line), let image = CIImage(data: data) else {
         emit("none")
         continue
     }
-    let request = VNDetectFaceRectanglesRequest()
     let handler = VNImageRequestHandler(ciImage: image, options: [:])
     do {
-        try handler.perform([request])
-        let faces = request.results ?? []
+        try handler.perform([faceRequest])
+        let faces = faceRequest.results ?? []
         if faces.count > 1 {
             emit("ambiguous \(faces.count)")
             continue
         }
-        if let face = faces.max(by: {
-            $0.boundingBox.width * $0.boundingBox.height < $1.boundingBox.width * $1.boundingBox.height
-        }) {
+        // A failed hand request must not disable an otherwise usable face.
+        let hands = (try? handler.perform([handRequest])) == nil ? "none" : palmPosition()
+        if let face = faces.first {
             let box = face.boundingBox
             let yaw = face.yaw?.doubleValue ?? 0
             let pitch = face.pitch?.doubleValue ?? 0
             let roll = face.roll?.doubleValue ?? 0
             let anglesValid = (face.yaw != nil && face.pitch != nil) ? 1 : 0
-            emit("face \(box.midX) \(box.midY) \(box.width) \(box.height) \(face.confidence) \(yaw) \(pitch) \(roll) \(anglesValid)")
+            emit("face \(box.midX) \(box.midY) \(box.width) \(box.height) \(face.confidence) \(yaw) \(pitch) \(roll) \(anglesValid)|\(hands)")
         } else {
-            emit("none")
+            emit("none|\(hands)")
         }
     } catch {
         emit("none")
@@ -88,6 +102,7 @@ class _VisionBridge:
 
     def __init__(self) -> None:
         self._process: Optional[subprocess.Popen[str]] = None
+        self.palm: Optional[Tuple[float, float]] = None
         self._lock = threading.Lock()
         self.error: Optional[str] = None
         self.last_status = "unavailable"
@@ -138,6 +153,7 @@ class _VisionBridge:
     def detect(self, jpeg_b64: str) -> Optional[FacePose]:
         """Return the largest Vision face for one base64 JPEG, if available."""
         with self._lock:
+            self.palm = None
             if self._process is None and not self._start():
                 self.last_status = "unavailable"
                 return None
@@ -155,7 +171,13 @@ class _VisionBridge:
                     self.last_status = "gap"
                     self._close_locked()
                     return None
-                line = process.stdout.readline().strip().split()
+                face_data, _, hand_data = process.stdout.readline().strip().partition("|")
+                hand_fields = hand_data.split()
+                if len(hand_fields) == 3 and hand_fields[0] == "palm":
+                    x, y = map(float, hand_fields[1:])
+                    if 0 <= x <= 1 and 0 <= y <= 1:
+                        self.palm = (x, y)
+                line = face_data.split()
                 if not line:
                     self._close_locked()
                     self.last_status = "gap"
@@ -239,6 +261,68 @@ class _OpenCVDetector:
             return None
 
 
+class HandWave:
+    """Track a single visible palm from a short rest through an out-and-back stroke."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.rest: Deque[Tuple[float, float]] = collections.deque(maxlen=3)
+        self.origin: Optional[Tuple[float, float]] = None
+        self.axis: Optional[str] = None
+        self.sign = 0
+        self.peak = 0.0
+        self.samples = 0
+        self.age = 0
+
+    @property
+    def ready(self) -> bool:
+        return self.origin is not None
+
+    def feed(self, point: Optional[Tuple[float, float]]) -> Optional[str]:
+        if point is None:
+            # A new hand entering the frame must establish its own origin.
+            self.reset()
+            return None
+        if self.origin is None:
+            self.rest.append(point)
+            if len(self.rest) == self.rest.maxlen:
+                xs, ys = zip(*self.rest)
+                if max(xs) - min(xs) < 0.045 and max(ys) - min(ys) < 0.045:
+                    self.origin = (statistics.median(xs), statistics.median(ys))
+            return None
+
+        dx, dy = point[0] - self.origin[0], point[1] - self.origin[1]
+        if self.axis is None:
+            if max(abs(dx), abs(dy)) < 0.09:
+                return None
+            if abs(dx) > 1.6 * abs(dy):
+                self.axis = "horizontal"
+            elif abs(dy) > 1.6 * abs(dx):
+                self.axis = "vertical"
+            else:
+                self.reset()
+                return None
+            displacement = dx if self.axis == "horizontal" else dy
+            self.sign = 1 if displacement > 0 else -1
+
+        along, across = (dx, dy) if self.axis == "horizontal" else (dy, dx)
+        travel = along * self.sign
+        self.age += 1
+        self.peak = max(self.peak, travel)
+        if self.age > 20 or abs(across) > max(0.07, self.peak * 0.65):
+            self.reset()
+            return None
+        if travel >= 0.09:
+            self.samples += 1
+        elif self.samples >= 2 and self.peak >= 0.14 and travel <= 0.45 * self.peak:
+            answer = "yes" if self.axis == "vertical" else "no"
+            self.reset()
+            return answer
+        return None
+
+
 class HeadGestures:
     """Turn a bounded JPEG stream into deliberate yes/no answers.
 
@@ -267,6 +351,7 @@ class HeadGestures:
         self.candidate_max_frames = max(6, candidate_max_frames)
         self._vision = _VisionBridge()
         self._opencv = _OpenCVDetector()
+        self._hand = HandWave()
         self._lock = threading.Lock()
         self.reset()
 
@@ -276,6 +361,8 @@ class HeadGestures:
             self.prompt_id = prompt_id
             self._calibration: Deque[Tuple[float, float]] = collections.deque(maxlen=self.calibration_frames)
             self._reset_tracking()
+            self._hand.reset()
+            self.answer_source = None
             self._answered = False
             self._gap_count = 0
             self._last_detection_status = "calibrating"
@@ -284,7 +371,7 @@ class HeadGestures:
     @property
     def ready(self) -> bool:
         """Whether there is a resting pose for the current question."""
-        return self._baseline is not None
+        return self._baseline is not None or self._hand.ready or self._answered
 
     @property
     def feature_mode(self) -> Optional[str]:
@@ -322,6 +409,15 @@ class HeadGestures:
         self._candidate_neutral = 0
         self._candidate_age = 0
         self._candidate_peak = 0.0
+        self._opposite_samples = 0
+        self._opposite_peak = 0.0
+
+    def _accept(self, answer: str, source: str = "camera") -> str:
+        self._clear_candidate()
+        self._answered = True
+        self.answer_source = source
+        self.last_status = "accepted_" + answer
+        return answer
 
     def _reset_tracking(self) -> None:
         self._calibration.clear()
@@ -440,19 +536,30 @@ class HeadGestures:
             if self._candidate_neutral >= return_frames:
                 # A lone large peak still needs two return frames.
                 sustained = self._candidate_samples >= 2 or strong_nod
+                if not nod and self._opposite_samples:
+                    # A fast shake may sample each side only once. Require
+                    # clear excursions on both sides and a settled return.
+                    sustained |= min(self._candidate_peak, self._opposite_peak) >= 1.5 * threshold
+                if sustained:
+                    return self._accept("yes" if nod else "no")
                 self._clear_candidate()
-                if not sustained:
-                    self.last_status = "ready"
-                    return None
-                answer = "yes" if nod else "no"
-                self._answered = True
-                self.last_status = "accepted_" + answer
-                return answer
+                self.last_status = "ready"
+                return None
             self.last_status = "returning_neutral"
             return None
 
         self._candidate_neutral = 0
         if abs(value) >= threshold and value * self._candidate_sign < 0:
+            if not nod and dominant == "horizontal":
+                # A normal shake crosses center without stopping there.
+                # Two measured samples on each side establish the gesture,
+                # even when no neutral frame was captured in between.
+                self._opposite_samples += 1
+                self._opposite_peak = max(self._opposite_peak, abs(value))
+                if self._candidate_samples >= 2 and self._opposite_samples >= 2:
+                    return self._accept("no")
+                self.last_status = "shake_reversal"
+                return None
             self._reset_tracking()
             self.last_status = "ambiguous_motion"
             return None
@@ -466,12 +573,19 @@ class HeadGestures:
         """Process one base64 JPEG frame and return ``yes``, ``no`` or ``None``."""
         if not isinstance(jpeg_b64, str) or not jpeg_b64.strip():
             with self._lock:
+                self._hand.reset()
                 self._register_gap("invalid_frame")
             return None
         pose = self._detect(jpeg_b64)
         with self._lock:
             if self._answered:
                 return None
+            if self._last_detection_status == "ambiguous_face":
+                self._hand.reset()
+            else:
+                hand_answer = self._hand.feed(self._vision.palm)
+                if hand_answer:
+                    return self._accept(hand_answer, "camera_hand")
             if pose is None:
                 self._register_gap(self._last_detection_status, hard=self._last_detection_status == "ambiguous_face")
                 return None

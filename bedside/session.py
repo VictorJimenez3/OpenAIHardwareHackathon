@@ -51,6 +51,7 @@ QUESTION_STAGES = {"pain", "position", "followup", "handoff_question", "other_ne
 DELIVERY_TIMEOUT = 7
 ANSWER_HINT_DELAY = 9
 CAMERA_ARM_DELAY = 0.75
+ANSWER_RECEIPT_SECONDS = 2.5
 LOCATION_IDLE_TIMEOUT = 25
 PLANNER_TIMEOUT = 3
 
@@ -65,6 +66,13 @@ class Screen:
     right_value: str = ""
     status: str = ""
     receipt: str = ""
+
+
+@dataclass(frozen=True)
+class RecordedAnswer:
+    value: str
+    source: str
+    advance_at: float
 
 
 class CheckIn:
@@ -127,7 +135,7 @@ class CheckIn:
         self.camera_ready = False
         self.camera_failed = False
         self.receipt = ""
-        self.pending_spoken_answer = ""
+        self.recorded_answer: RecordedAnswer | None = None
         self.stage = "ready"
         self.entered = self.clock()
         self.screen = self._screen()
@@ -209,7 +217,7 @@ class CheckIn:
                 self.camera_streaming = False
                 self._camera_error(event)
             elif event.get("prompt_id") == self.prompt_id:
-                if kind == "input" and event.get("source") != "camera":
+                if kind == "input" and event.get("source", "touch") in ("touch", "gesture"):
                     self._answer(event.get("value"), event.get("source", "touch"))
         elif role == "caregiver":
             self._handle_caregiver_event(kind, event)
@@ -226,7 +234,9 @@ class CheckIn:
         elif kind == "camera_error":
             self._camera_error(event)
         elif kind == "input" and self.camera_ready and event.get("value") in ("yes", "no"):
-            self._answer(event["value"], "camera")
+            source = event.get("source", "camera")
+            if source in ("camera", "camera_hand"):
+                self._answer(event["value"], source)
 
     def _handle_caregiver_event(self, kind, event):
         """Handle display/ack events without conflating report revisions.
@@ -284,6 +294,12 @@ class CheckIn:
 
     def tick(self):
         now = self.clock()
+        if self.recorded_answer is not None:
+            recorded = self.recorded_answer
+            if now >= recorded.advance_at:
+                self.recorded_answer = None
+                self._apply_answer(recorded.value, recorded.source)
+            return
         elapsed = now - self.entered
         if self.stage == "sending" and elapsed >= DELIVERY_TIMEOUT:
             self._enter("retry")
@@ -309,7 +325,9 @@ class CheckIn:
             self._update_screen()
 
     def _answer(self, value, source):
-        if not isinstance(value, str) or source not in ("touch", "camera", "gesture"):
+        if self.recorded_answer is not None:
+            return
+        if not isinstance(value, str) or source not in ("touch", "camera", "camera_hand", "gesture"):
             return
         if (value == "send" or (self.camera and value == "start")) and source != "touch":
             return
@@ -319,6 +337,10 @@ class CheckIn:
             return
         if value in {"yes", "no"} and self.stage in QUESTION_STAGES:
             self._record_answer(value, source)
+            return
+        self._apply_answer(value, source)
+
+    def _apply_answer(self, value, source):
         if value == "start" and self.stage in {
             "ready", "empty", "acknowledged",
         }:
@@ -422,20 +444,23 @@ class CheckIn:
     def _record_answer(self, value, source):
         self._disarm_camera()
         answer = value.capitalize()
-        self.pending_spoken_answer = f"{answer} recorded."
+        self.recorded_answer = RecordedAnswer(value, source, self.clock() + ANSWER_RECEIPT_SECONDS)
         if source == "gesture":
-            self.receipt = f"Swipe: {answer}"
-            return
-        if source == "camera":
-            method = "Nod accepted" if value == "yes" else "Shake accepted"
-            self.receipt = f"{method}: {answer}"
+            method, label = "Swipe accepted", "Swipe"
+        elif source == "camera_hand":
+            method = label = "Hand accepted"
+        elif source == "camera":
+            method = label = "Nod accepted" if value == "yes" else "Shake accepted"
         else:
-            method = "Touch accepted"
-            self.receipt = f"Touch: {answer}"
-        self.send("patient", {
-            "type": "answer_feedback", "prompt_id": self.prompt_id,
-            "answer": answer, "method": method,
-        })
+            method, label = "Touch accepted", "Touch"
+        self.receipt = f"{label}: {answer}"
+        if source != "gesture":
+            self.send("patient", {
+                "type": "answer_feedback", "prompt_id": self.prompt_id,
+                "answer": answer, "method": method,
+            })
+        self._update_screen()
+        self.speak(f"{answer} recorded.", exact=True)
 
     def _start_new_checkin(self):
         """Reset all report/revision state after an explicit new check-in."""
@@ -457,8 +482,6 @@ class CheckIn:
         self.initial_request_id = ""
         self.update_request_id = ""
         self.initial_acknowledged = False
-        self.receipt = ""
-        self.pending_spoken_answer = ""
         self.message = ""
         self.pain = False
         self.confirmed = {}
@@ -673,25 +696,20 @@ class CheckIn:
 
     def _enter(self, stage):
         self._disarm_camera()
+        self.recorded_answer = None
+        self.receipt = ""
         self.stage = stage
         self.prompt_number += 1
         self.entered = self.clock()
         self.camera_arm_at = self.entered + CAMERA_ARM_DELAY
         self.no_answer_hint = False
         self._update_screen()
-        # A new utterance interrupts the previous one. Speak the receipt with
-        # the next prompt, even when a planner takes a moment to choose it.
-        if stage in {"choosing", "handoff_choosing", "handoff_pain_choosing"}:
-            return
-        confirmation = self.pending_spoken_answer
-        self.pending_spoken_answer = ""
         if stage in QUESTION_STAGES:
-            self.speak(f"{confirmation} {self.screen.text}".strip())
+            self.speak(self.screen.text)
         elif stage == "review":
-            self.speak(f"{confirmation} Your message is: {self.message} {self.screen.status}".strip(),
-                       exact=True)
-        elif confirmation:
-            self.speak(f"{confirmation} {self.screen.title}.", exact=True)
+            self.speak(f"Your message is: {self.message} {self.screen.status}", exact=True)
+        elif stage == "empty":
+            self.speak(self.screen.text, exact=True)
 
     def _update_screen(self, *, reset_input=False):
         screen = replace(self._screen(), receipt=self.receipt)
@@ -710,13 +728,17 @@ class CheckIn:
             self.send("patient", packet)
 
     def _screen(self):
+        if self.recorded_answer is not None:
+            # Keep the answered question in view until its receipt expires.
+            # Clearing the choices also makes a reconnect during the hold inert.
+            return Screen(self.screen.title, self.screen.text, status="Continuing automatically.")
         if self.stage in QUESTION_STAGES:
             if self.no_answer_hint:
                 hint = "No answer yet. Use touch anytime."
             elif self.camera_ready:
-                hint = "Nod for Yes. Shake for No."
+                hint = "Yes: nod or hand up/down. No: shake or hand sideways."
             elif self.camera_streaming and not self.camera_failed:
-                hint = "Face the camera and hold still."
+                hint = "Hold your face or one hand still."
             elif self.gesture_ready:
                 hint = "Swipe right Yes, left No."
             elif self.stage == "position":

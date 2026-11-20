@@ -90,7 +90,8 @@ class CameraInput:
                     last_report = time.monotonic()
                 if answer:
                     self.emit("camera", {"type": "input", "prompt_id": prompt_id,
-                                         "generation": generation, "value": answer})
+                                         "generation": generation, "value": answer,
+                                         "source": model.answer_source})
 
     def close(self):
         self.stop.set()
@@ -206,7 +207,7 @@ def main():
     parser.add_argument("--patient-port", help="CoreS3 serial port (auto-detected by default)")
     parser.add_argument("--caregiver-port", help="StickS3 serial port (auto-detected by default)")
     parser.add_argument("--voice", choices=("auto", "live", "local", "off"), default="auto")
-    parser.add_argument("--camera", action="store_true", help="Enable experimental CoreS3 head gestures")
+    parser.add_argument("--camera", action="store_true", help="Enable CoreS3 camera head and hand gestures")
     parser.add_argument("--gesture", action="store_true",
                         help="Opt in to the patient's low-movement swipe input")
     mode = parser.add_mutually_exclusive_group()
