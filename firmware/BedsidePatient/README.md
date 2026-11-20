@@ -25,9 +25,9 @@ method. The host can send immediate feedback for the current prompt:
 {"type":"answer_feedback","prompt_id":"pain-1","answer":"Yes","method":"Nod accepted"}
 ```
 
-The host keeps the answered question on screen for 2.5 seconds with its
-`receipt`, for example `"receipt":"Nod accepted: Yes"`. The next prompt has a
-new ID and an empty receipt. Review waits for the patient to tap Send.
+The next screen can carry that result in `receipt`, for example
+`"receipt":"Nod accepted: Yes"`. The receipt stays visible as the status hint
+changes. The host clears it with an empty receipt when a new check-in begins.
 
 Touch produces an event tied to the currently displayed prompt.
 

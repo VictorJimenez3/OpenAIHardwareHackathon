@@ -30,7 +30,7 @@ Use a short fictional caregiver note. The first question asks whether the person
 
 `--adaptive --scenario comfort`, `--adaptive --scenario mouth`, and `--adaptive --scenario pain` run repeatable scenarios. The planner uses the scenario and the patient’s confirmed pain answer to pick a follow-up or move to review. The local scenario question tree handles planner timeouts. Use `--scripted` for the original pain and position demo.
 
-`--camera` opens a live CoreS3 camera preview on the Mac and enables experimental gesture answers. The Mac uses Apple Vision and requires the Swift compiler. Face the level camera or hold one hand still in view. For **Yes**, nod or move that hand up and down. For **No**, shake your head or move that hand side to side. Return to rest. The CoreS3 shows **Yes recorded** or **No recorded** for 2.5 seconds and advances automatically. Each new question starts with a clear screen and calibrates again. With voice enabled, the Mac reads back the accepted answer. Start and Send use touch. See the [demo trial criteria](doc/PROJECT_SETUP.md#demo-decisions).
+`--camera` enables experimental nod and shake input on yes/no questions and opens a live CoreS3 camera preview on the Mac. The preview requires the macOS Swift compiler. Keep the CoreS3 level, face its camera, and hold still until the movement cue appears. Make one deliberate motion and return to center. The CoreS3 shows **Yes recorded** or **No recorded** and the accepted input method. With voice enabled, the Mac also reads back the accepted answer. You can use the touchscreen at any time. Start and Send are touch controls. Use the [demo trial criteria](doc/PROJECT_SETUP.md#demo-decisions) before presenting camera input to an audience.
 
 `--gesture` enables the optional U127 hand-swipe input. Connect the unit to the red Port A on the CoreS3 body. When the host reports **Gesture input ready**, swipe right for **Yes** and left for **No**, about 5–15 cm above the sensor. Use the touchscreen for **Send**.
 
@@ -44,6 +44,6 @@ Build the two sketches in `firmware/` with the M5Stack Arduino ESP32 board packa
 uv run --python 3.12 python -m bedside --simulate both --voice local
 ```
 
-To test the lower-leg path, enter `start`, `yes`, `send`, `no`, `no`, `yes`, `send`, and `ack` on separate lines. Wait for the next prompt after each Yes or No. `--simulate patient` or `--simulate caregiver` replaces only one board. Use `quit` to stop a simulated run or Ctrl+C to stop the physical demo.
+To test the lower-leg path, enter `start`, `yes`, `send`, `no`, `no`, `yes`, `send`, and `ack` on separate lines. `--simulate patient` or `--simulate caregiver` replaces only one board. Use `quit` to stop a simulated run or Ctrl+C to stop the physical demo.
 
 The [showcase runbook](doc/SHOWCASE.md) has the walk-up demo. The [project setup](doc/PROJECT_SETUP.md) and [user story](doc/USER_STORY_AND_DEMO.md) contain the original build plan.

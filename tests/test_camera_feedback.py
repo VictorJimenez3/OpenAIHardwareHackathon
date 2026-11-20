@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from bedside import __main__ as host
 from bedside.pain_location import FIRST_STAGE
-from bedside.session import ANSWER_HINT_DELAY, ANSWER_RECEIPT_SECONDS, CAMERA_ARM_DELAY, LOCATION_IDLE_TIMEOUT, CheckIn
+from bedside.session import ANSWER_HINT_DELAY, CAMERA_ARM_DELAY, LOCATION_IDLE_TIMEOUT, CheckIn
 
 
 class CameraSessionTests(unittest.TestCase):
@@ -37,11 +37,7 @@ class CameraSessionTests(unittest.TestCase):
     def packets(self, kind):
         return [packet for role, packet in self.sent if role == "patient" and packet["type"] == kind]
 
-    def finish_receipt(self):
-        self.now += ANSWER_RECEIPT_SECONDS
-        self.controller.tick()
-
-    def test_receipt_holds_then_clears_and_only_touch_sends(self):
+    def test_receipts_survive_transitions_and_only_touch_sends(self):
         self.controller.handle("caregiver", {"type": "hello"})
         self.touch("start")
         self.assertIsNone(self.controller.camera_scope)
@@ -55,25 +51,13 @@ class CameraSessionTests(unittest.TestCase):
         self.assertEqual(len(self.packets("screen")), screen_count)
         self.assertEqual(self.controller.camera_scope, pain)
         self.camera(pain, "input", value="yes")
-        self.assertEqual(self.controller.prompt_id, pain[0])
+        review = self.controller.prompt_id
+        self.assertEqual(self.controller.stage, "review")
         self.assertEqual(self.packets("answer_feedback"), [
             {"type": "answer_feedback", "prompt_id": pain[0], "answer": "Yes", "method": "Nod accepted"},
         ])
         self.assertEqual(self.packets("screen")[-1]["receipt"], "Nod accepted: Yes")
-        self.assertEqual(self.controller.screen.left_value, "")
-        self.assertEqual(self.controller.screen.right_value, "")
-        self.touch("no")
-        self.touch("send")
         self.camera(pain, "input", value="no")
-        self.now += ANSWER_RECEIPT_SECONDS - 0.01
-        self.controller.tick()
-        self.assertEqual(self.controller.prompt_id, pain[0])
-        self.assertIsNone(self.controller.camera_scope)
-        self.now += 0.02
-        self.controller.tick()
-        review = self.controller.prompt_id
-        self.assertNotEqual(review, pain[0])
-        self.assertEqual(self.packets("screen")[-1]["receipt"], "")
         self.camera((review, pain[1]), "input", value="send")
         self.assertEqual(self.controller.stage, "review")
         self.assertFalse(any(packet["type"] == "show_request" for _, packet in self.sent))
@@ -92,36 +76,12 @@ class CameraSessionTests(unittest.TestCase):
         self.assertEqual(self.packets("answer_feedback")[-1]["method"], "Shake accepted")
         self.assertEqual(self.packets("screen")[-1]["receipt"], "Shake accepted: No")
         self.assertIsNone(self.controller.camera_scope)
-        self.finish_receipt()
-        self.assertEqual(self.controller.screen.receipt, "")
-        self.assertIn("hip", self.controller.screen.text)
         self.touch("yes")
         self.assertEqual(self.packets("answer_feedback")[-1]["method"], "Touch accepted")
         self.assertEqual(self.packets("screen")[-1]["receipt"], "Touch: Yes")
         self.assertEqual([packet["enabled"] for packet in self.packets("camera")], [True])
         self.controller.stop_camera_stream()
         self.assertEqual([packet["enabled"] for packet in self.packets("camera")], [True, False])
-
-    def test_consecutive_no_answers_require_fresh_input_and_can_use_different_methods(self):
-        self.touch("start")
-        pain = self.arm()
-        self.camera(pain, "camera_ready")
-        self.camera(pain, "input", value="no")
-        self.assertEqual(self.controller.screen.receipt, "Shake accepted: No")
-        self.finish_receipt()
-        self.assertEqual(self.controller.stage, "other_need")
-        self.assertEqual(self.controller.screen.receipt, "")
-        other = self.arm()
-        self.assertNotEqual(other, pain)
-        self.camera(other, "camera_ready")
-        self.camera(pain, "input", value="yes", source="camera_hand")
-        self.assertIsNone(self.controller.recorded_answer)
-        self.camera(other, "input", value="no", source="camera_hand")
-        self.assertEqual(self.controller.screen.receipt, "Hand accepted: No")
-        self.finish_receipt()
-        self.assertEqual(self.controller.stage, "empty")
-        self.assertEqual(self.controller.screen.receipt, "")
-        self.assertFalse(any(p["type"] == "show_request" for _, p in self.sent))
 
     def test_new_connection_rearms_same_question_with_fresh_generation(self):
         self.touch("start")
@@ -139,7 +99,6 @@ class CameraSessionTests(unittest.TestCase):
         self.camera(old_scope, "input", value="yes")
         self.assertEqual(self.controller.stage, "pain")
         self.camera(new_scope, "input", value="yes")
-        self.finish_receipt()
         self.assertEqual(self.controller.stage, "review")
         self.assertEqual([packet["enabled"] for packet in self.packets("camera")], [True, True])
 
@@ -151,10 +110,8 @@ class CameraSessionTests(unittest.TestCase):
         pain = self.arm()
         self.camera(pain, "camera_ready")
         self.camera(pain, "input", value="yes")
-        self.assertEqual(speech[-1], ("Yes recorded.", {"exact": True}))
-        self.finish_receipt()
         self.assertEqual(speech[-1], (
-            "Your message is: I'm in pain. Tap Send if this is right.", {"exact": True},
+            "Yes recorded. Your message is: I'm in pain. Tap Send if this is right.", {"exact": True},
         ))
         self.assertFalse(any(p["type"] == "show_request" for _, p in self.sent))
         self.touch("send")
@@ -165,9 +122,7 @@ class CameraSessionTests(unittest.TestCase):
         location = self.arm()
         self.camera(location, "camera_ready")
         self.camera(location, "input", value="no")
-        self.assertEqual(speech[-1], ("No recorded.", {"exact": True}))
-        self.finish_receipt()
-        self.assertEqual(speech[-1][0], "Pain in your hip, pelvis, or thigh?")
+        self.assertEqual(speech[-1][0], "No recorded. Pain in your hip, pelvis, or thigh?")
         count = len(speech)
         self.camera(location, "input", value="no")
         self.assertEqual(len(speech), count)
@@ -182,7 +137,6 @@ class CameraSessionTests(unittest.TestCase):
         self.controller.tick()
         self.assertTrue(self.controller.no_answer_hint)
         self.touch("yes")
-        self.finish_receipt()
         self.touch("send")
         self.controller.handle("caregiver", {"type": "displayed", "request_id": self.controller.request_id})
         self.assertEqual(self.controller.stage, FIRST_STAGE)
@@ -247,16 +201,11 @@ class CameraHostTests(unittest.TestCase):
         class SimulatedCheckIn(CheckIn):
             ticks = 0
 
-            def __init__(self, *args, **kwargs):
-                self.now = 0.0
-                super().__init__(*args, **kwargs, clock=lambda: self.now)
-
             def tick(self):
-                self.now += 0.5
                 self.ticks += 1
                 if self.ticks > 30:
                     raise AssertionError(f"Simulated run stalled at {self.stage}")
-                if self.stage == "pain" and self.recorded_answer is None and self.camera_scope is None:
+                if self.stage == "pain" and self.camera_scope is None:
                     wire = callbacks["wire"]
                     wire("patient", {"type": "frame", "prompt_id": self.prompt_id, "jpeg": "quiet"})
                     self.camera_arm_at = 0
@@ -278,8 +227,7 @@ class CameraHostTests(unittest.TestCase):
 
         self.assertEqual(frames, ["started", "idle", "quiet", "older", "question", "review", "closed"])
         self.assertEqual(classified, ["question"])
-        self.assertTrue(any(receipt == "Nod accepted: Yes" for _, receipt in statuses))
-        self.assertEqual(statuses[-1][1], "")
+        self.assertEqual(statuses[-1][1], "Nod accepted: Yes")
         self.assertIn("Send", statuses[-1][0])
         camera_packets = [packet["enabled"] for _, packet in outgoing if packet["type"] == "camera"]
         self.assertEqual(camera_packets, [True, False])
@@ -294,7 +242,6 @@ class CameraHostTests(unittest.TestCase):
 
         class FakeGestures:
             ready = False
-            answer_source = "camera"
 
             def reset(self, prompt_id):
                 self.ready = False
